@@ -84,13 +84,14 @@ describe("extractSizeMB", () => {
 
 describe("seederScore", () => {
 	it.each([
-		[1500, 50],
-		[750, 40],
-		[300, 30],
-		[150, 20],
-		[75, 10],
-		[25, 5],
-		[3, -200],
+		[1500, 150],
+		[750, 150],
+		[300, 126],
+		[150, 103],
+		[75, 81],
+		[25, 45],
+		[3, -24],
+		[2, -200],
 		[0, -500],
 	])("seederScore(%i) === %i", (n, expected) => {
 		expect(seederScore(n)).toBe(expected);
@@ -432,7 +433,7 @@ describe("handleRequest — manifest", () => {
 		expect(body.name).toBe("StreamPeak");
 		expect(body.resources).toContain("stream");
 		expect(body.logo).toBeDefined();
-		expect(body.background).toBeDefined();
+		expect(body.logo).toContain("streampeak.png");
 	});
 });
 

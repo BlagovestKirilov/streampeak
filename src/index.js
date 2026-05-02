@@ -20,12 +20,11 @@ const MANIFEST = {
 	version: "1.0.0",
 	name: "StreamPeak",
 	description:
-		"Automatically picks the best 4K, 1080p, and 720p stream from Torrentio so you never have to scroll through 50 results again.",
+		"Stop guessing which stream to pick. StreamPeak analyzes every available stream and surfaces only the best 4K, 1080p, and 720p options — scored by quality, audio, and reliability. Built by Blagovest Kirilov.",
 	types: ["movie", "series"],
 	catalogs: [],
 	resources: ["stream"],
-	logo: "https://i.imgur.com/placeholder.png",
-	background: "https://i.imgur.com/placeholder.png",
+	logo: "https://raw.githubusercontent.com/BlagovestKirilov/streampeak/master/assets/streampeak.png",
 };
 
 // ---------------------------------------------------------------------------
@@ -114,17 +113,16 @@ const QUALITY_GROUPS =
 	/\b(YTS|YIFY|SPARKS|FGT|ROVERS|GECKOS|DEFLATE|CMRG|NTb|FLUX|LAZY|TEPES|MZABI|TIGOLE)\b/i;
 
 /**
- * SEEDER SCORE — tiebreaker; low seeder counts are penalised.
+ * SEEDER SCORE — logarithmic curve so seeders are a meaningful factor.
+ *
+ * Range: -500 (dead) → -200 (nearly dead) → ~0 (10 seeders) → 150 (500+).
+ * The log curve ensures the jump from 17→229 is significant (~85 pts)
+ * while 229→1000 adds diminishing returns (~33 pts).
  */
 function seederScore(n) {
-	if (n >= 1000) return 50;
-	if (n >= 500) return 40;
-	if (n >= 200) return 30;
-	if (n >= 100) return 20;
-	if (n >= 50) return 10;
-	if (n >= 10) return 5;
-	if (n > 0) return -200;
-	return -500; // 0 seeders — effectively discard
+	if (n <= 0) return -500;
+	if (n < 3) return -200;
+	return Math.min(Math.round(75 * Math.log10(n) - 60), 150);
 }
 
 // ---------------------------------------------------------------------------
