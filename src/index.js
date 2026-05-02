@@ -1,5 +1,5 @@
 /**
- * Best Stream Selector — Cloudflare Worker
+ * StreamPeak — Stremio Addon
  *
  * Fetches all streams from Torrentio, scores every stream across eight
  * dimensions (resolution, release type, HDR, audio, encoding, seeders, file
@@ -436,7 +436,6 @@ async function fetchTorrentioStreams(type, id) {
 
 	try {
 		const response = await fetch(url, {
-			headers: { "User-Agent": "streampeak/1.0" },
 			signal: AbortSignal.timeout(10_000),
 		});
 
@@ -530,6 +529,24 @@ async function handleRequest(request) {
 		return jsonResponse(debugInfo, 200, 0, true);
 	}
 
+	// ── /diag/:type/:id ──────────────────────────────────────────────────────
+	const diagMatch = pathname.match(/^\/diag\/(movie|series)\/([^/]+)$/);
+	if (diagMatch) {
+		const [, type, id] = diagMatch;
+		const url = `${TORRENTIO_BASE}/stream/${type}/${id}.json`;
+		const result = { url, status: null, headers: {}, bodySnippet: "", error: null };
+		try {
+			const response = await fetch(url, { signal: AbortSignal.timeout(10_000), redirect: "manual" });
+			result.status = response.status;
+			for (const [k, v] of response.headers) result.headers[k] = v;
+			const text = await response.text();
+			result.bodySnippet = text.slice(0, 500);
+		} catch (err) {
+			result.error = err.message;
+		}
+		return jsonResponse(result, 200, 0, true);
+	}
+
 	// ── / (root redirect) ────────────────────────────────────────────────────
 	if (pathname === "/" || pathname === "") {
 		return new Response(null, {
@@ -542,17 +559,7 @@ async function handleRequest(request) {
 }
 
 // ---------------------------------------------------------------------------
-// Worker entry point
-// ---------------------------------------------------------------------------
-
-export default {
-	async fetch(request, env, ctx) {
-		return handleRequest(request);
-	},
-};
-
-// ---------------------------------------------------------------------------
-// Named exports for unit testing
+// Exports
 // ---------------------------------------------------------------------------
 
 export {

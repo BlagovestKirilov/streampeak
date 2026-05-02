@@ -1,17 +1,14 @@
 {
   "name": "streampeak",
   "version": "1.0.0",
-  "description": "Stremio addon StreamPeak — picks the best 4K, 1080p, and 720p stream from Torrentio",
+  "type": "module",
+  "description": "Stremio addon StreamPeak — picks the best 4K, 1080p, 720p, and 480p stream from Torrentio",
   "private": true,
   "scripts": {
-    "deploy": "wrangler deploy",
-    "dev": "wrangler dev --log-level warn",
-    "start": "wrangler dev --log-level warn",
+    "start": "node server.js",
     "test": "vitest"
   },
   "devDependencies": {
-    "@cloudflare/vitest-pool-workers": "^0.12.4",
-    "vitest": "~3.2.0",
-    "wrangler": "^4.87.0"
+    "vitest": "~3.2.0"
   }
 }

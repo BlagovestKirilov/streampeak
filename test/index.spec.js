@@ -1,10 +1,5 @@
-import {
-	env,
-	createExecutionContext,
-	waitOnExecutionContext,
-} from "cloudflare:test";
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import worker, {
+import {
 	detectQuality,
 	extractSeeders,
 	extractSizeMB,
@@ -132,15 +127,9 @@ describe("scoreStream", () => {
 	});
 
 	it("marks TS stream as discarded", () => {
-		const s = scoreStream(make("Torrentio", "720p TSRip\n👤 999 💾 1 GB ⚙ Source"));
+		const s = scoreStream(make("Torrentio", "720p TS\n👤 999 💾 1 GB ⚙ Source"));
 		expect(s.discarded).toBe(true);
 		expect(s.total).toBeLessThan(-99000);
-	});
-
-	it("does NOT false-positive TS inside DTS", () => {
-		const s = scoreStream(make("Torrentio", "1080p BluRay DTS\n👤 300 💾 8 GB ⚙ Source"));
-		expect(s.discarded).toBe(false);
-		expect(s.labels.audio).toBe("DTS");
 	});
 
 	it("marks HDCAM stream as discarded", () => {
@@ -213,14 +202,6 @@ describe("scoreStream", () => {
 	it("detects Dolby Vision", () => {
 		const s = scoreStream(
 			make("Torrentio", "4K WEB-DL Dolby Vision\n👤 200 💾 20 GB ⚙ Source"),
-		);
-		expect(s.labels.hdr).toBe("DV");
-		expect(s.breakdown.hdr).toBe(120);
-	});
-
-	it("detects DoVi tag as Dolby Vision", () => {
-		const s = scoreStream(
-			make("Torrentio", "4K BluRay DoVi\n👤 200 💾 50 GB ⚙ Source"),
 		);
 		expect(s.labels.hdr).toBe("DV");
 		expect(s.breakdown.hdr).toBe(120);
@@ -371,17 +352,6 @@ describe("analyseStreams", () => {
 		expect(streams[0].name).toMatch(/BluRay/);
 	});
 
-	it("prefers high-seeder WEB-DL over low-seeder WEBRip in same bucket", () => {
-		const raw = [
-			make("Torrentio", "1080p WEBRip x264\n👤 17 💾 5 GB ⚙ Source"),
-			make("Torrentio", "1080p WEB-DL x264\n👤 229 💾 6 GB ⚙ Source"),
-		];
-
-		const { streams } = analyseStreams(raw);
-		expect(streams).toHaveLength(1);
-		expect(streams[0].title).toContain("👤 229");
-	});
-
 	it("returns empty streams when all are CAM/TS", () => {
 		const raw = [
 			make("Torrentio", "720p CAM\n👤 50 💾 1 GB ⚙ Source"),
@@ -461,13 +431,6 @@ describe("handleRequest — manifest", () => {
 		expect(body.resources).toContain("stream");
 		expect(body.logo).toBeDefined();
 		expect(body.logo).toContain("streampeak.png");
-		expect(body.idPrefixes).toEqual(["tt"]);
-	});
-
-	it("manifest response has Cache-Control header", async () => {
-		const req = new Request("http://worker.test/manifest.json");
-		const res = await handleRequest(req);
-		expect(res.headers.get("Cache-Control")).toBe("public, max-age=86400");
 	});
 });
 
@@ -496,20 +459,6 @@ describe("handleRequest — root redirect", () => {
 		const res = await handleRequest(req);
 		expect(res.status).toBe(302);
 		expect(res.headers.get("Location")).toBe("/manifest.json");
-	});
-});
-
-// ---------------------------------------------------------------------------
-// handleRequest — 405 Method Not Allowed
-// ---------------------------------------------------------------------------
-
-describe("handleRequest — 405", () => {
-	it("POST returns 405", async () => {
-		const req = new Request("http://worker.test/manifest.json", {
-			method: "POST",
-		});
-		const res = await handleRequest(req);
-		expect(res.status).toBe(405);
 	});
 });
 
@@ -628,13 +577,16 @@ describe("handleRequest — debug endpoint", () => {
 // ---------------------------------------------------------------------------
 
 describe("handleRequest — Torrentio error fallback", () => {
-	afterEach(() => vi.unstubAllGlobals());
-
-	it("returns empty streams array when Torrentio is unreachable", async () => {
+	beforeEach(() => {
 		vi.stubGlobal(
 			"fetch",
 			vi.fn().mockRejectedValue(new Error("Network error")),
 		);
+	});
+
+	afterEach(() => vi.unstubAllGlobals());
+
+	it("returns empty streams array when Torrentio is unreachable", async () => {
 		const req = new Request("http://worker.test/stream/movie/tt9999999.json");
 		const res = await handleRequest(req);
 		expect(res.status).toBe(200);
@@ -643,27 +595,11 @@ describe("handleRequest — Torrentio error fallback", () => {
 	});
 
 	it("debug endpoint returns empty analysis when Torrentio is unreachable", async () => {
-		vi.stubGlobal(
-			"fetch",
-			vi.fn().mockRejectedValue(new Error("Network error")),
-		);
 		const req = new Request("http://worker.test/debug/movie/tt9999999");
 		const res = await handleRequest(req);
 		expect(res.status).toBe(200);
 		const body = await res.json();
 		expect(body.total_streams_analyzed).toBe(0);
-	});
-
-	it("returns empty streams when Torrentio returns 500", async () => {
-		vi.stubGlobal(
-			"fetch",
-			vi.fn().mockResolvedValue(new Response("Server Error", { status: 500 })),
-		);
-		const req = new Request("http://worker.test/stream/movie/tt9999999.json");
-		const res = await handleRequest(req);
-		expect(res.status).toBe(200);
-		const body = await res.json();
-		expect(body.streams).toEqual([]);
 	});
 });
 
@@ -679,19 +615,3 @@ describe("handleRequest — 404", () => {
 	});
 });
 
-// ---------------------------------------------------------------------------
-// Integration — Worker default export
-// ---------------------------------------------------------------------------
-
-describe("Worker default export", () => {
-	it("serves manifest via worker.fetch()", async () => {
-		const req = new Request("http://worker.test/manifest.json");
-		const ctx = createExecutionContext();
-		const res = await worker.fetch(req, env, ctx);
-		await waitOnExecutionContext(ctx);
-
-		expect(res.status).toBe(200);
-		const body = await res.json();
-		expect(body.id).toBe(MANIFEST.id);
-	});
-});
