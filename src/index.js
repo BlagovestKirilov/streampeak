@@ -1,11 +1,11 @@
 /**
  * Best Stream Selector — Cloudflare Worker
  *
- * Fetches all streams from Torrentio, scores every stream across five
+ * Fetches all streams from Torrentio, scores every stream across eight
  * dimensions (resolution, release type, HDR, audio, encoding, seeders, file
  * size sanity, release-group bonus), discards CAM/TS entries, buckets the
- * rest into 4K / 1080p / 720p, and returns the single highest-scoring stream
- * per bucket — up to three streams total.
+ * rest into 4K / 1080p / 720p / 480p, and returns the single
+ * highest-scoring stream per bucket — up to four streams total.
  *
  * Also exposes a /debug/:type/:id endpoint that returns the full per-stream
  * score breakdown so you can inspect the selection logic without opening Stremio.
@@ -20,10 +20,11 @@ const MANIFEST = {
 	version: "1.0.0",
 	name: "StreamPeak",
 	description:
-		"Stop guessing which stream to pick. StreamPeak analyzes every available stream and surfaces only the best 4K, 1080p, and 720p options — scored by quality, audio, and reliability. Built by Blagovest Kirilov.",
+		"Stop guessing which stream to pick. StreamPeak analyzes every available stream and surfaces only the best 4K, 1080p, 720p, and 480p options — scored by quality, audio, and reliability. Built by Blagovest Kirilov.",
 	types: ["movie", "series"],
 	catalogs: [],
 	resources: ["stream"],
+	idPrefixes: ["tt"],
 	logo: "https://raw.githubusercontent.com/BlagovestKirilov/streampeak/master/assets/streampeak.png",
 };
 
@@ -70,7 +71,7 @@ const RELEASE_TYPE = [
 	// CAM / TS — always discard
 	{ re: /\bhdcam\b|\btelesync\b|\bpdvd\b/i, score: -99999, label: "HDCAM/TS" },
 	{ re: /\bcam\b/i, score: -99999, label: "CAM" },
-	{ re: /\bts\b/i, score: -99999, label: "TS" },
+	{ re: /\bts(?:rip)?\b(?![-\w])/i, score: -99999, label: "TS" },
 ];
 
 /**
@@ -78,7 +79,7 @@ const RELEASE_TYPE = [
  */
 const HDR_TYPES = [
 	{ re: /hdr10\+|hdr10plus/i, score: 150, label: "HDR10+" },
-	{ re: /dolby.?vision|\bdv\b/i, score: 120, label: "DV" },
+	{ re: /dolby.?vision|\bdovi\b/i, score: 120, label: "DV" },
 	{ re: /\bhdr\b/i, score: 100, label: "HDR" },
 ];
 
@@ -93,7 +94,7 @@ const AUDIO_TYPES = [
 	{ re: /dts.?hd/i, score: 70, label: "DTS-HD" },
 	{ re: /\bdts\b/i, score: 70, label: "DTS" },
 	{ re: /dd\+|eac3|dolby.?digital.?plus/i, score: 60, label: "DD+" },
-	{ re: /\bac3\b|dolby.?digital|\bdd\b|5\.1/i, score: 40, label: "DD" },
+	{ re: /\bac3\b|dolby.?digital|\bdd\b/i, score: 40, label: "DD" },
 	{ re: /\baac\b/i, score: 20, label: "AAC" },
 ];
 
@@ -359,6 +360,7 @@ function analyseStreams(rawStreams) {
 		["4k", null],
 		["1080p", null],
 		["720p", null],
+		["480p", null],
 	]);
 
 	const discardedLog = [];
@@ -376,8 +378,8 @@ function analyseStreams(rawStreams) {
 			continue;
 		}
 
-		// Only bucket recognised quality tiers (skip 480p / unknown)
-		if (!["4k", "1080p", "720p"].includes(scored.quality)) continue;
+		// Only bucket recognised quality tiers (skip unknown)
+		if (!["4k", "1080p", "720p", "480p"].includes(scored.quality)) continue;
 
 		const current = buckets.get(scored.quality);
 		if (!current || scored.total > current.scored.total) {
@@ -389,7 +391,7 @@ function analyseStreams(rawStreams) {
 	const streams = [];
 	const winners = {};
 
-	for (const quality of ["4k", "1080p", "720p"]) {
+	for (const quality of ["4k", "1080p", "720p", "480p"]) {
 		const entry = buckets.get(quality);
 		if (!entry) continue;
 
@@ -455,14 +457,18 @@ async function fetchTorrentioStreams(type, id) {
 // HTTP helpers
 // ---------------------------------------------------------------------------
 
-function jsonResponse(data, status = 200) {
-	return new Response(JSON.stringify(data, null, 2), {
-		status,
-		headers: {
-			...CORS_HEADERS,
-			"Content-Type": "application/json; charset=utf-8",
-		},
-	});
+function jsonResponse(data, status = 200, cacheSeconds = 0, pretty = false) {
+	const headers = {
+		...CORS_HEADERS,
+		"Content-Type": "application/json; charset=utf-8",
+	};
+	if (cacheSeconds > 0) {
+		headers["Cache-Control"] = `public, max-age=${cacheSeconds}`;
+	}
+	const body = pretty
+		? JSON.stringify(data, null, 2)
+		: JSON.stringify(data);
+	return new Response(body, { status, headers });
 }
 
 function notFound() {
@@ -499,7 +505,7 @@ async function handleRequest(request) {
 
 	// ── /manifest.json ──────────────────────────────────────────────────────
 	if (pathname === "/manifest.json") {
-		return jsonResponse(MANIFEST);
+		return jsonResponse(MANIFEST, 200, 86400);
 	}
 
 	// ── /stream/:type/:id.json ───────────────────────────────────────────────
@@ -510,7 +516,7 @@ async function handleRequest(request) {
 		const [, type, id] = streamMatch;
 		const rawStreams = await fetchTorrentioStreams(type, id);
 		const streams = selectBestStreams(rawStreams);
-		return jsonResponse({ streams });
+		return jsonResponse({ streams }, 200, 900);
 	}
 
 	// ── /debug/:type/:id ─────────────────────────────────────────────────────
@@ -521,7 +527,7 @@ async function handleRequest(request) {
 		const [, type, id] = debugMatch;
 		const rawStreams = await fetchTorrentioStreams(type, id);
 		const { debugInfo } = analyseStreams(rawStreams);
-		return jsonResponse(debugInfo);
+		return jsonResponse(debugInfo, 200, 0, true);
 	}
 
 	// ── / (root redirect) ────────────────────────────────────────────────────
