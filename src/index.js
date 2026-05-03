@@ -26,6 +26,10 @@ const MANIFEST = {
 	resources: ["stream"],
 	idPrefixes: ["tt"],
 	logo: "https://raw.githubusercontent.com/BlagovestKirilov/streampeak/master/assets/streampeak.png",
+	stremioAddonsConfig: {
+		issuer: "https://stremio-addons.net",
+		signature: "eyJhbGciOiJkaXIiLCJlbmMiOiJBMTI4Q0JDLUhTMjU2In0..F8mYf_QjIQ2UrNQuUW5LEg.RdTsUe28jg_cvhCj1aHYxON696q46tnoFYPu6Zi1gxq4bs6bbTjVNU67mpgzpvUrTQ9onFVmvHIbYN4dXqFVuXbRgolmUPHPmPDY2Pc-Ko0hOWe9s64_sYtxRjQFuh59.Sq8z-U-w1j7td5eyZS4kBg",
+	},
 };
 
 // ---------------------------------------------------------------------------
