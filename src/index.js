@@ -492,7 +492,7 @@ function notFound() {
  *   OPTIONS *  (CORS pre-flight)
  *   GET  /  (redirect → /manifest.json)
  */
-async function handleRequest(request) {
+async function handleRequest(request, ctx) {
 	const { pathname } = new URL(request.url);
 
 	if (request.method === "OPTIONS") {
@@ -517,9 +517,22 @@ async function handleRequest(request) {
 	);
 	if (streamMatch) {
 		const [, type, id] = streamMatch;
+
+		// Check Cloudflare edge cache first
+		const cache = caches.default;
+		const cacheKey = new Request(request.url);
+		const cached = await cache.match(cacheKey);
+		if (cached) return cached;
+
+		const ttl = type === "movie" ? 7200 : 3600;
 		const rawStreams = await fetchTorrentioStreams(type, id);
 		const streams = selectBestStreams(rawStreams);
-		return jsonResponse({ streams }, 200, 900);
+		const response = jsonResponse({ streams }, 200, ttl);
+
+		// Store in edge cache asynchronously — does not block the response
+		if (ctx) ctx.waitUntil(cache.put(cacheKey, response.clone()));
+
+		return response;
 	}
 
 	// ── /debug/:type/:id ─────────────────────────────────────────────────────
@@ -549,8 +562,8 @@ async function handleRequest(request) {
 // ---------------------------------------------------------------------------
 
 export default {
-	async fetch(request) {
-		return handleRequest(request);
+	async fetch(request, _env, ctx) {
+		return handleRequest(request, ctx);
 	},
 };
 

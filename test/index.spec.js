@@ -431,7 +431,7 @@ describe("handleRequest — manifest", () => {
 
 		const body = await res.json();
 		expect(body.id).toBe(MANIFEST.id);
-		expect(body.version).toBe("1.0.0");
+		expect(body.version).toBe(MANIFEST.version);
 		expect(body.name).toBe("StreamPeak");
 		expect(body.resources).toContain("stream");
 		expect(body.logo).toBeDefined();
@@ -518,6 +518,76 @@ describe("handleRequest — stream endpoint", () => {
 		expect(res.status).toBe(200);
 		const body = await res.json();
 		expect(Array.isArray(body.streams)).toBe(true);
+	});
+});
+
+// ---------------------------------------------------------------------------
+// handleRequest — caching
+// ---------------------------------------------------------------------------
+
+describe("handleRequest — caching", () => {
+	const mockStreams = [
+		{ name: "T", title: "1080p WEB-DL\n👤 300 💾 6 GB ⚙ S", url: "magnet:?m" },
+	];
+	const mockFetchFn = () =>
+		new Response(JSON.stringify({ streams: mockStreams }), { status: 200 });
+	const noCacheMock = {
+		match: vi.fn().mockResolvedValue(undefined),
+		put: vi.fn().mockResolvedValue(undefined),
+	};
+
+	beforeEach(() => {
+		vi.stubGlobal("fetch", vi.fn().mockImplementation(mockFetchFn));
+		vi.stubGlobal("caches", { default: noCacheMock });
+		noCacheMock.match.mockClear();
+		noCacheMock.put.mockClear();
+	});
+
+	afterEach(() => vi.unstubAllGlobals());
+
+	it("movie stream response has Cache-Control max-age=7200", async () => {
+		const req = new Request("http://worker.test/stream/movie/tt0468569.json");
+		const res = await handleRequest(req);
+		expect(res.headers.get("Cache-Control")).toBe("public, max-age=7200");
+	});
+
+	it("series stream response has Cache-Control max-age=3600", async () => {
+		const req = new Request("http://worker.test/stream/series/tt0903747:1:1.json");
+		const res = await handleRequest(req);
+		expect(res.headers.get("Cache-Control")).toBe("public, max-age=3600");
+	});
+
+	it("returns cached response when cache hits and does not call Torrentio", async () => {
+		const cachedBody = JSON.stringify({ streams: [{ name: "cached", title: "cached", url: "m" }] });
+		const cachedResponse = new Response(cachedBody, {
+			status: 200,
+			headers: { "Content-Type": "application/json" },
+		});
+		const hitCacheMock = {
+			match: vi.fn().mockResolvedValue(cachedResponse),
+			put: vi.fn().mockResolvedValue(undefined),
+		};
+		vi.stubGlobal("caches", { default: hitCacheMock });
+		const fetchSpy = vi.fn();
+		vi.stubGlobal("fetch", fetchSpy);
+
+		const req = new Request("http://worker.test/stream/movie/tt0468569.json");
+		const res = await handleRequest(req);
+		const body = await res.json();
+
+		expect(hitCacheMock.match).toHaveBeenCalledOnce();
+		expect(fetchSpy).not.toHaveBeenCalled();
+		expect(body.streams[0].name).toBe("cached");
+	});
+
+	it("stores response in cache on miss", async () => {
+		const ctx = { waitUntil: vi.fn((p) => p) };
+		const req = new Request("http://worker.test/stream/movie/tt0468569.json");
+		await handleRequest(req, ctx);
+
+		expect(noCacheMock.match).toHaveBeenCalledOnce();
+		expect(ctx.waitUntil).toHaveBeenCalledOnce();
+		expect(noCacheMock.put).toHaveBeenCalledOnce();
 	});
 });
 
