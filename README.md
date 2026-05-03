@@ -54,12 +54,10 @@ StreamPeak does the work for you. It analyzes every available stream, scores it 
 
 ## Installation
 
-> **Important:** If you have Torrentio installed, **uninstall it first**. StreamPeak fetches from Torrentio internally — running both will produce duplicate results.
-
 1. Open **Stremio** → **Settings** → **Addons**
 2. Paste the addon URL into the search/install box:
    ```
-   https://stremio-best-stream.<your-subdomain>.workers.dev/manifest.json
+   https://addon.streampeak.workers.dev/manifest.json
    ```
 3. Click **Install**
 
@@ -83,25 +81,6 @@ StreamPeak evaluates every stream across eight independent dimensions. The strea
 | **Release Group** | Known quality groups | Bonus for trusted uploaders |
 
 Streams with zero seeders or CAM/TS sources are **automatically excluded** — they never appear in your results.
-
----
-
-## Performance
-
-StreamPeak runs on **Cloudflare Workers** — a globally distributed edge runtime with no cold starts. Every request is handled by the nearest data center, keeping latency minimal no matter where you are.
-
-- **Manifest** responses are cached for 24 hours
-- **Stream** responses are cached for 15 minutes
-- Torrentio requests include a 10-second timeout to prevent hangs
-
----
-
-## Roadmap
-
-- **Real-Debrid / AllDebrid integration** — prioritize cached instant links
-- **User preferences** — configurable quality tiers, minimum seeder thresholds
-- **Multi-source aggregation** — combine streams from multiple providers before scoring
-- **Sub-tier separation** — distinguish 4K HDR from 4K SDR, or 1080p Remux from 1080p encode
 
 ---
 

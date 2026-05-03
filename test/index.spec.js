@@ -591,6 +591,18 @@ describe("handleRequest — Torrentio error fallback", () => {
 
 	afterEach(() => vi.unstubAllGlobals());
 
+	it("returns empty streams array when Torrentio returns non-200", async () => {
+		vi.stubGlobal(
+			"fetch",
+			vi.fn().mockResolvedValue(new Response("Internal Server Error", { status: 500 })),
+		);
+		const req = new Request("http://worker.test/stream/movie/tt9999999.json");
+		const res = await handleRequest(req);
+		expect(res.status).toBe(200);
+		const body = await res.json();
+		expect(body.streams).toEqual([]);
+	});
+
 	it("returns empty streams array when Torrentio is unreachable", async () => {
 		const req = new Request("http://worker.test/stream/movie/tt9999999.json");
 		const res = await handleRequest(req);

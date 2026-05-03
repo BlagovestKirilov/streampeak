@@ -34,6 +34,9 @@ const MANIFEST = {
 
 const TORRENTIO_BASE = "https://torrentio.withoutthefuss.dpdns.org";
 
+/** Quality buckets — single source of truth for tier ordering. */
+const QUALITY_TIERS = ["4k", "1080p", "720p", "480p"];
+
 /** CORS headers required by Stremio */
 const CORS_HEADERS = {
 	"Access-Control-Allow-Origin": "*",
@@ -356,19 +359,14 @@ function buildStreamName(quality, scored) {
  */
 function analyseStreams(rawStreams) {
 	/** @type {Map<string, {stream: object, scored: object}>} */
-	const buckets = new Map([
-		["4k", null],
-		["1080p", null],
-		["720p", null],
-		["480p", null],
-	]);
+	const buckets = new Map(QUALITY_TIERS.map((q) => [q, null]));
 
 	const discardedLog = [];
 
 	for (const stream of rawStreams) {
 		const scored = scoreStream(stream);
 
-		if (scored.discarded || scored.total <= -99999) {
+		if (scored.discarded) {
 			discardedLog.push({
 				name: stream.name ?? "",
 				title: (stream.title ?? "").split("\n")[0],
@@ -379,7 +377,7 @@ function analyseStreams(rawStreams) {
 		}
 
 		// Only bucket recognised quality tiers (skip unknown)
-		if (!["4k", "1080p", "720p", "480p"].includes(scored.quality)) continue;
+		if (!QUALITY_TIERS.includes(scored.quality)) continue;
 
 		const current = buckets.get(scored.quality);
 		if (!current || scored.total > current.scored.total) {
@@ -391,7 +389,7 @@ function analyseStreams(rawStreams) {
 	const streams = [];
 	const winners = {};
 
-	for (const quality of ["4k", "1080p", "720p", "480p"]) {
+	for (const quality of QUALITY_TIERS) {
 		const entry = buckets.get(quality);
 		if (!entry) continue;
 
@@ -463,6 +461,8 @@ function jsonResponse(data, status = 200, cacheSeconds = 0, pretty = false) {
 	};
 	if (cacheSeconds > 0) {
 		headers["Cache-Control"] = `public, max-age=${cacheSeconds}`;
+	} else {
+		headers["Cache-Control"] = "no-store";
 	}
 	const body = pretty
 		? JSON.stringify(data, null, 2)
@@ -527,24 +527,6 @@ async function handleRequest(request) {
 		const rawStreams = await fetchTorrentioStreams(type, id);
 		const { debugInfo } = analyseStreams(rawStreams);
 		return jsonResponse(debugInfo, 200, 0, true);
-	}
-
-	// ── /diag/:type/:id ──────────────────────────────────────────────────────
-	const diagMatch = pathname.match(/^\/diag\/(movie|series)\/([^/]+)$/);
-	if (diagMatch) {
-		const [, type, id] = diagMatch;
-		const url = `${TORRENTIO_BASE}/stream/${type}/${id}.json`;
-		const result = { url, status: null, headers: {}, bodySnippet: "", error: null };
-		try {
-			const response = await fetch(url, { signal: AbortSignal.timeout(10_000), redirect: "manual" });
-			result.status = response.status;
-			for (const [k, v] of response.headers) result.headers[k] = v;
-			const text = await response.text();
-			result.bodySnippet = text.slice(0, 500);
-		} catch (err) {
-			result.error = err.message;
-		}
-		return jsonResponse(result, 200, 0, true);
 	}
 
 	// ── / (root redirect) ────────────────────────────────────────────────────
