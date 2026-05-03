@@ -1,7 +1,7 @@
 {
   "name": "streampeak",
   "version": "1.0.0",
-  "description": "Stremio addon StreamPeak — picks the best 4K, 1080p, 720p, and 480p stream from Torrentio",
+  "description": "Stop guessing which stream to pick. StreamPeak analyzes every available stream and surfaces only the best. Built by Blagovest Kirilov.",
   "private": true,
   "scripts": {
     "deploy": "wrangler deploy",

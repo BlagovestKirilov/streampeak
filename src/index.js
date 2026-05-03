@@ -20,7 +20,7 @@ const MANIFEST = {
 	version: "1.0.0",
 	name: "StreamPeak",
 	description:
-		"Stop guessing which stream to pick. StreamPeak analyzes every available stream and surfaces only the best 4K, 1080p, 720p, and 480p options — scored by quality, audio, and reliability. Built by Blagovest Kirilov.",
+		"Stop guessing which stream to pick. StreamPeak analyzes every available stream and surfaces only the best. Built by Blagovest Kirilov.",
 	types: ["movie", "series"],
 	catalogs: [],
 	resources: ["stream"],
