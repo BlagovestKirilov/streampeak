@@ -5,10 +5,13 @@
   "description": "Stremio addon StreamPeak — picks the best 4K, 1080p, 720p, and 480p stream from Torrentio",
   "private": true,
   "scripts": {
-    "start": "node server.js",
+    "deploy": "wrangler deploy",
+    "dev": "wrangler dev --log-level warn",
     "test": "vitest"
   },
   "devDependencies": {
-    "vitest": "~3.2.0"
+    "@cloudflare/vitest-pool-workers": "^0.12.4",
+    "vitest": "~3.2.0",
+    "wrangler": "^4.87.0"
   }
 }

@@ -32,7 +32,7 @@ const MANIFEST = {
 // Constants
 // ---------------------------------------------------------------------------
 
-const TORRENTIO_BASE = "https://torrentio.strem.fun";
+const TORRENTIO_BASE = "https://torrentio.withoutthefuss.dpdns.org";
 
 /** CORS headers required by Stremio */
 const CORS_HEADERS = {
@@ -559,7 +559,17 @@ async function handleRequest(request) {
 }
 
 // ---------------------------------------------------------------------------
-// Exports
+// Worker entry point
+// ---------------------------------------------------------------------------
+
+export default {
+	async fetch(request) {
+		return handleRequest(request);
+	},
+};
+
+// ---------------------------------------------------------------------------
+// Named exports for unit testing
 // ---------------------------------------------------------------------------
 
 export {

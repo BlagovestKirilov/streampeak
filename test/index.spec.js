@@ -1,5 +1,10 @@
-import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import {
+	env,
+	createExecutionContext,
+	waitOnExecutionContext,
+} from "cloudflare:test";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import worker, {
 	detectQuality,
 	extractSeeders,
 	extractSizeMB,
@@ -615,3 +620,19 @@ describe("handleRequest — 404", () => {
 	});
 });
 
+// ---------------------------------------------------------------------------
+// Integration — Worker default export
+// ---------------------------------------------------------------------------
+
+describe("Worker default export", () => {
+	it("serves manifest via worker.fetch()", async () => {
+		const req = new Request("http://worker.test/manifest.json");
+		const ctx = createExecutionContext();
+		const res = await worker.fetch(req, env, ctx);
+		await waitOnExecutionContext(ctx);
+
+		expect(res.status).toBe(200);
+		const body = await res.json();
+		expect(body.id).toBe(MANIFEST.id);
+	});
+});

@@ -1,0 +1,10 @@
+{
+	"$schema": "node_modules/wrangler/config-schema.json",
+	"name": "addon",
+	"main": "src/index.js",
+	"compatibility_date": "2026-05-02",
+	"observability": {
+		"enabled": true
+	},
+	"upload_source_maps": true
+}
