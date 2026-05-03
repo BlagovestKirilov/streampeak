@@ -1,6 +1,6 @@
 {
   "name": "streampeak",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Stop guessing which stream to pick. StreamPeak analyzes every available stream and surfaces only the best. Built by Blagovest Kirilov.",
   "private": true,
   "scripts": {
