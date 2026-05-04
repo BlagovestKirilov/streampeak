@@ -5,6 +5,7 @@ import {
 } from "cloudflare:test";
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import worker, {
+	detectLanguage,
 	detectQuality,
 	extractSeeders,
 	extractSizeMB,
@@ -35,6 +36,52 @@ describe("detectQuality", () => {
 		["No resolution info", null],
 	])('detectQuality("%s") === %s', (text, expected) => {
 		expect(detectQuality(text)).toBe(expected);
+	});
+});
+
+// ---------------------------------------------------------------------------
+// detectLanguage
+// ---------------------------------------------------------------------------
+
+describe("detectLanguage", () => {
+	it("detects English keyword → score 100, no label", () => {
+		expect(detectLanguage("1080p WEB-DL English")).toEqual({ score: 100, label: "" });
+	});
+
+	it("detects 'eng' abbreviation → score 100", () => {
+		expect(detectLanguage("BluRay ENG x265")).toEqual({ score: 100, label: "" });
+	});
+
+	it("detects 🇬🇧 flag → score 100", () => {
+		expect(detectLanguage("🇬🇧 English 1080p")).toEqual({ score: 100, label: "" });
+	});
+
+	it("detects 🇺🇸 flag → score 100", () => {
+		expect(detectLanguage("🇺🇸 1080p WEB-DL")).toEqual({ score: 100, label: "" });
+	});
+
+	it("detects Multi → score 50, no label", () => {
+		expect(detectLanguage("Multi 4K BluRay")).toEqual({ score: 50, label: "" });
+	});
+
+	it("detects non-English flag (🇷🇺) → score -200, label 'non-EN'", () => {
+		expect(detectLanguage("🇷🇺 Russian 1080p")).toEqual({ score: -200, label: "non-EN" });
+	});
+
+	it("detects non-English flag (🇩🇪) → score -200, label 'non-EN'", () => {
+		expect(detectLanguage("🇩🇪 1080p WEB-DL")).toEqual({ score: -200, label: "non-EN" });
+	});
+
+	it("detects explicit non-English language word → score -200", () => {
+		expect(detectLanguage("French 1080p BluRay")).toEqual({ score: -200, label: "non-EN" });
+	});
+
+	it("returns score 0 when no language info", () => {
+		expect(detectLanguage("1080p WEB-DL x265 Atmos")).toEqual({ score: 0, label: "" });
+	});
+
+	it("English takes priority over flag catch-all (🇬🇧 matched first)", () => {
+		expect(detectLanguage("🇬🇧 English 4K BluRay")).toEqual({ score: 100, label: "" });
 	});
 });
 
@@ -266,6 +313,37 @@ describe("scoreStream", () => {
 		expect(dts.breakdown.audio).toBe(70);
 		expect(dtsHd.breakdown.audio).toBeGreaterThan(dts.breakdown.audio);
 	});
+
+	it("English stream gets +100 language bonus", () => {
+		const s = scoreStream(make("🇬🇧 English", "1080p WEB-DL x265\n👤 100 💾 6 GB ⚙ Source"));
+		expect(s.breakdown.language).toBe(100);
+		expect(s.labels.language).toBe("");
+	});
+
+	it("Multi stream gets +50 language bonus", () => {
+		const s = scoreStream(make("Multi", "1080p WEB-DL x265\n👤 100 💾 6 GB ⚙ Source"));
+		expect(s.breakdown.language).toBe(50);
+		expect(s.labels.language).toBe("");
+	});
+
+	it("non-English stream (Russian flag) gets -200 language penalty and 'non-EN' label", () => {
+		const s = scoreStream(make("🇷🇺 Russian", "1080p WEB-DL x265\n👤 100 💾 6 GB ⚙ Source"));
+		expect(s.breakdown.language).toBe(-200);
+		expect(s.labels.language).toBe("non-EN");
+	});
+
+	it("unknown language gets 0 language pts", () => {
+		const s = scoreStream(make("Torrentio", "1080p WEB-DL x265\n👤 100 💾 6 GB ⚙ Source"));
+		expect(s.breakdown.language).toBe(0);
+		expect(s.labels.language).toBe("");
+	});
+
+	it("English stream scores higher than identical non-English stream", () => {
+		const eng = scoreStream(make("🇬🇧 English", "1080p WEB-DL x265\n👤 200 💾 6 GB ⚙ Source"));
+		const rus = scoreStream(make("🇷🇺 Russian", "1080p WEB-DL x265\n👤 200 💾 6 GB ⚙ Source"));
+		expect(eng.total).toBeGreaterThan(rus.total);
+		expect(eng.total - rus.total).toBe(300);
+	});
 });
 
 // ---------------------------------------------------------------------------
@@ -332,6 +410,16 @@ describe("buildStreamName", () => {
 		};
 		const name = buildStreamName("720p", scored);
 		expect(name).toBe("⚡ 720p | WEBRip");
+	});
+
+	it("language label does not appear in stream name (scoring only)", () => {
+		const scored = {
+			labels: { releaseType: "WEB-DL", hdr: "", audio: "DD+", encoding: "", language: "non-EN" },
+			seeders: 100,
+			sizeMB: 6 * 1024,
+		};
+		const name = buildStreamName("1080p", scored);
+		expect(name).toBe("⚡ 1080p | WEB-DL DD+");
 	});
 });
 
@@ -452,6 +540,26 @@ describe("analyseStreams", () => {
 		const { streams } = analyseStreams(raw);
 		expect(streams).toHaveLength(1);
 		expect(streams[0].name).toMatch(/WEB-DL/);
+	});
+
+	it("English stream beats non-English stream of same quality and seeders", () => {
+		const raw = [
+			make("🇷🇺 Russian", "1080p WEB-DL x265\n👤 200 💾 8 GB ⚙ Source"),
+			make("🇬🇧 English", "1080p WEB-DL x265\n👤 200 💾 8 GB ⚙ Source"),
+		];
+		const { streams } = analyseStreams(raw);
+		expect(streams).toHaveLength(1);
+		expect(streams[0].name).not.toMatch(/\[non-EN\]/);
+	});
+
+	it("non-English winner shows same name format as English (no language tag)", () => {
+		const raw = [
+			make("🇷🇺 Russian", "1080p WEB-DL x265\n👤 200 💾 8 GB ⚙ Source"),
+		];
+		const { streams } = analyseStreams(raw);
+		expect(streams).toHaveLength(1);
+		expect(streams[0].name).toMatch(/^⚡ 1080p/);
+		expect(streams[0].name).not.toMatch(/non-EN/);
 	});
 });
 

@@ -115,6 +115,24 @@ const ENCODING_TYPES = [
 ];
 
 /**
+ * LANGUAGE SCORE
+ * Torrentio encodes language in the stream name field, e.g.
+ * "🇬🇧 English", "🇷🇺 Russian", "Multi", "🇧🇬 Bulgarian" etc.
+ * English / multi-language → small bonus.
+ * Explicitly non-English → penalty (still shown if no better option exists).
+ * No language tag detected → neutral (most pure-English releases omit it).
+ */
+const LANGUAGE_SCORE = [
+	{ re: /\benglish\b|\beng\b|🇬🇧|🇺🇸|🇦🇺/iu, score: 100, label: "" },
+	{ re: /\bmulti\b/i, score: 50, label: "" },
+	// Non-English flag emoji block U+1F1E6–U+1F1FF covers all country flags.
+	// We match any flag pair NOT already matched above as non-English.
+	{ re: /[\u{1F1E6}-\u{1F1FF}]{2}/u, score: -200, label: "non-EN" },
+	// Explicit language words that are clearly non-English
+	{ re: /\b(french|spanish|german|italian|portuguese|russian|hindi|arabic|turkish|korean|japanese|chinese|dutch|polish|swedish|norwegian|danish|finnish|romanian|hungarian|bulgarian|greek|hebrew|thai|vietnamese|ukrainian|czech|slovak|croatian|serbian|slovenian|latvian|lithuanian|estonian|persian|indonesian|malay)\b/i, score: -200, label: "non-EN" },
+];
+
+/**
  * KNOWN QUALITY RELEASE GROUPS — bonus points
  */
 const QUALITY_GROUPS =
@@ -137,6 +155,17 @@ function seederScore(n) {
 // ---------------------------------------------------------------------------
 // Extraction helpers
 // ---------------------------------------------------------------------------
+
+/**
+ * Detects language preference score from a stream's name+title.
+ * Returns { score, label } — label is empty string for English/Multi (no tag needed).
+ */
+function detectLanguage(text) {
+	for (const { re, score, label } of LANGUAGE_SCORE) {
+		if (re.test(text)) return { score, label };
+	}
+	return { score: 0, label: "" };
+}
 
 /**
  * Returns which quality bucket a stream belongs to ("4k" | "1080p" | "720p" |
@@ -283,6 +312,11 @@ function scoreStream(stream) {
 	// ── Release-group bonus ───────────────────────────────────────────────────
 	const groupBonus = QUALITY_GROUPS.test(combined) ? 50 : 0;
 
+	// ── Language ──────────────────────────────────────────────────────────────
+	const lang = detectLanguage(combined);
+	const languagePts = lang.score;
+	const languageLabel = lang.label;
+
 	// ── Total ─────────────────────────────────────────────────────────────────
 	const total =
 		resolutionPts +
@@ -292,7 +326,8 @@ function scoreStream(stream) {
 		encodingPts +
 		seederPts +
 		sizePenalty +
-		groupBonus;
+		groupBonus +
+		languagePts;
 
 	return {
 		total,
@@ -308,12 +343,14 @@ function scoreStream(stream) {
 			seeders: seederPts,
 			sizePenalty,
 			groupBonus,
+			language: languagePts,
 		},
 		labels: {
 			releaseType: releaseTypeLabel,
 			hdr: hdrLabel,
 			audio: audioLabel,
 			encoding: encodingLabel,
+			language: languageLabel,
 		},
 		seeders,
 		sizeMB,
@@ -603,6 +640,7 @@ export default {
 // ---------------------------------------------------------------------------
 
 export {
+	detectLanguage,
 	detectQuality,
 	extractSeeders,
 	extractSizeMB,
