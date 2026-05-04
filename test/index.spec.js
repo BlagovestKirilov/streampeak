@@ -13,9 +13,12 @@ import worker, {
 	buildStreamName,
 	analyseStreams,
 	selectBestStreams,
+	fetchTorrentioStreams,
 	handleRequest,
 	MANIFEST,
 } from "../src/index.js";
+
+const TORRENTIO_DEFAULT = "https://torrentio.withoutthefuss.dpdns.org";
 
 // ---------------------------------------------------------------------------
 // detectQuality
@@ -92,7 +95,7 @@ describe("seederScore", () => {
 		[25, 45],
 		[3, -24],
 		[2, -200],
-		[0, -500],
+		[0, -99999],
 	])("seederScore(%i) === %i", (n, expected) => {
 		expect(seederScore(n)).toBe(expected);
 	});
@@ -116,7 +119,7 @@ describe("scoreStream", () => {
 		expect(s.breakdown.releaseType).toBe(400);
 		expect(s.breakdown.hdr).toBe(100);
 		expect(s.breakdown.audio).toBe(100);
-		expect(s.breakdown.encoding).toBe(30);
+		expect(s.breakdown.encoding).toBe(50);
 		expect(s.seeders).toBe(342);
 		expect(s.labels.releaseType).toBe("BluRay");
 		expect(s.labels.hdr).toBe("HDR");
@@ -177,9 +180,16 @@ describe("scoreStream", () => {
 
 	it("applies group bonus for known release groups", () => {
 		const s = scoreStream(
-			make("[YTS] Movie", "1080p WEB-DL\n👤 200 💾 6 GB ⚙ YTS"),
+			make("[SPARKS] Movie", "1080p WEB-DL\n👤 200 💾 6 GB ⚙ SPARKS"),
 		);
 		expect(s.breakdown.groupBonus).toBe(50);
+	});
+
+	it("does NOT apply group bonus for YIFY/YTS (low quality groups)", () => {
+		const s = scoreStream(
+			make("[YTS] Movie", "1080p WEB-DL\n👤 200 💾 6 GB ⚙ YTS"),
+		);
+		expect(s.breakdown.groupBonus).toBe(0);
 	});
 
 	it("no group bonus for unknown groups", () => {
@@ -189,11 +199,12 @@ describe("scoreStream", () => {
 		expect(s.breakdown.groupBonus).toBe(0);
 	});
 
-	it("heavily penalises 0-seeder streams", () => {
+	it("gives 0-seeder streams -99999 seeder score (discarded)", () => {
 		const s = scoreStream(
 			make("Torrentio", "1080p BluRay\n👤 0 💾 8 GB ⚙ Source"),
 		);
-		expect(s.breakdown.seeders).toBe(-500);
+		expect(s.breakdown.seeders).toBe(-99999);
+		expect(s.seeders).toBe(0);
 	});
 
 	it("detects HDR10+", () => {
@@ -225,7 +236,7 @@ describe("scoreStream", () => {
 			make("Torrentio", "1080p BluRay x265\n👤 300 💾 8 GB ⚙ Source"),
 		);
 		expect(s.labels.encoding).toBe("x265");
-		expect(s.breakdown.encoding).toBe(30);
+		expect(s.breakdown.encoding).toBe(50);
 	});
 
 	it("detects AV1 encoding", () => {
@@ -233,7 +244,27 @@ describe("scoreStream", () => {
 			make("Torrentio", "1080p WEB-DL AV1\n👤 300 💾 4 GB ⚙ Source"),
 		);
 		expect(s.labels.encoding).toBe("AV1");
-		expect(s.breakdown.encoding).toBe(25);
+		expect(s.breakdown.encoding).toBe(45);
+	});
+
+	it("detects x264 encoding", () => {
+		const s = scoreStream(
+			make("Torrentio", "1080p WEB-DL x264\n👤 300 💾 4 GB ⚙ Source"),
+		);
+		expect(s.labels.encoding).toBe("x264");
+		expect(s.breakdown.encoding).toBe(20);
+	});
+
+	it("DTS-HD scores 75, higher than plain DTS (70)", () => {
+		const dtsHd = scoreStream(
+			make("Torrentio", "1080p BluRay DTS-HD\n👤 300 💾 15 GB ⚙ Source"),
+		);
+		const dts = scoreStream(
+			make("Torrentio", "1080p BluRay DTS\n👤 300 💾 15 GB ⚙ Source"),
+		);
+		expect(dtsHd.breakdown.audio).toBe(75);
+		expect(dts.breakdown.audio).toBe(70);
+		expect(dtsHd.breakdown.audio).toBeGreaterThan(dts.breakdown.audio);
 	});
 });
 
@@ -404,6 +435,24 @@ describe("analyseStreams", () => {
 		expect(debugInfo.winner_4k.score).toBeGreaterThan(0);
 		expect(debugInfo.winner_4k.breakdown).toBeDefined();
 	});
+
+	it("discards 0-seeder streams and logs reason as '0 seeders'", () => {
+		const raw = [make("Torrentio", "1080p BluRay\n👤 0 💾 8 GB ⚙ Source")];
+		const { streams, debugInfo } = analyseStreams(raw);
+		expect(streams).toHaveLength(0);
+		expect(debugInfo.discarded).toHaveLength(1);
+		expect(debugInfo.discarded[0].reason).toBe("0 seeders");
+	});
+
+	it("0-seeder stream loses to same stream with seeders", () => {
+		const raw = [
+			make("Torrentio", "1080p BluRay\n👤 0 💾 8 GB ⚙ Source"),
+			make("Torrentio", "1080p WEB-DL\n👤 5 💾 6 GB ⚙ Source"),
+		];
+		const { streams } = analyseStreams(raw);
+		expect(streams).toHaveLength(1);
+		expect(streams[0].name).toMatch(/WEB-DL/);
+	});
 });
 
 describe("selectBestStreams", () => {
@@ -491,6 +540,7 @@ describe("handleRequest — stream endpoint", () => {
 			vi.fn().mockResolvedValue(
 				new Response(JSON.stringify({ streams: mockStreams }), {
 					status: 200,
+					headers: { "content-type": "application/json" },
 				}),
 			),
 		);
@@ -527,10 +577,15 @@ describe("handleRequest — stream endpoint", () => {
 
 describe("handleRequest — caching", () => {
 	const mockStreams = [
-		{ name: "T", title: "1080p WEB-DL\n👤 300 💾 6 GB ⚙ S", url: "magnet:?m" },
+		{ name: "T", title: "4K BluRay x265 Atmos\n👤 400 💾 50 GB ⚙ S", url: "magnet:?a" },
+		{ name: "T", title: "1080p WEB-DL x265\n👤 300 💾 6 GB ⚙ S", url: "magnet:?b" },
+		{ name: "T", title: "720p WEBRip\n👤 200 💾 2 GB ⚙ S", url: "magnet:?c" },
 	];
 	const mockFetchFn = () =>
-		new Response(JSON.stringify({ streams: mockStreams }), { status: 200 });
+		new Response(JSON.stringify({ streams: mockStreams }), {
+			status: 200,
+			headers: { "content-type": "application/json" },
+		});
 	const noCacheMock = {
 		match: vi.fn().mockResolvedValue(undefined),
 		put: vi.fn().mockResolvedValue(undefined),
@@ -589,6 +644,208 @@ describe("handleRequest — caching", () => {
 		expect(ctx.waitUntil).toHaveBeenCalledOnce();
 		expect(noCacheMock.put).toHaveBeenCalledOnce();
 	});
+
+	it("uses 2-minute TTL when Torrentio returns empty (failure/429)", async () => {
+		vi.stubGlobal(
+			"fetch",
+			vi.fn().mockResolvedValue(
+				new Response(JSON.stringify({ streams: [] }), {
+					status: 200,
+					headers: { "content-type": "application/json" },
+				}),
+			),
+		);
+		const req = new Request("http://worker.test/stream/movie/tt0468569.json");
+		const res = await handleRequest(req);
+		expect(res.headers.get("Cache-Control")).toBe("public, max-age=120");
+	});
+
+	it("uses 10-minute TTL when fewer than 3 streams (new release)", async () => {
+		const sparse = [
+			{ name: "T", title: "1080p WEB-DL\n👤 50 💾 6 GB ⚙ S", url: "magnet:?a" },
+		];
+		vi.stubGlobal(
+			"fetch",
+			vi.fn().mockResolvedValue(
+				new Response(JSON.stringify({ streams: sparse }), {
+					status: 200,
+					headers: { "content-type": "application/json" },
+				}),
+			),
+		);
+		const req = new Request("http://worker.test/stream/movie/tt0468569.json");
+		const res = await handleRequest(req);
+		expect(res.headers.get("Cache-Control")).toBe("public, max-age=600");
+	});
+});
+
+// ---------------------------------------------------------------------------
+// handleRequest — security & defensive fixes
+// ---------------------------------------------------------------------------
+
+describe("handleRequest — id validation", () => {
+	afterEach(() => vi.unstubAllGlobals());
+
+	it("rejects invalid id (no tt prefix) and returns empty streams without calling Torrentio", async () => {
+		const fetchSpy = vi.fn();
+		vi.stubGlobal("fetch", fetchSpy);
+		vi.stubGlobal("caches", { default: { match: vi.fn().mockResolvedValue(undefined), put: vi.fn() } });
+
+		const req = new Request("http://worker.test/stream/movie/INVALID_ID.json");
+		const res = await handleRequest(req);
+		const body = await res.json();
+
+		expect(res.status).toBe(200);
+		expect(body.streams).toEqual([]);
+		expect(fetchSpy).not.toHaveBeenCalled();
+	});
+
+	it("accepts valid movie id (tt1234567)", async () => {
+		vi.stubGlobal(
+			"fetch",
+			vi.fn().mockResolvedValue(
+				new Response(JSON.stringify({ streams: [] }), {
+					status: 200,
+					headers: { "content-type": "application/json" },
+				}),
+			),
+		);
+		vi.stubGlobal("caches", { default: { match: vi.fn().mockResolvedValue(undefined), put: vi.fn() } });
+
+		const req = new Request("http://worker.test/stream/movie/tt1234567.json");
+		const res = await handleRequest(req);
+		expect(res.status).toBe(200);
+	});
+
+	it("accepts valid series id (tt1234567:2:5)", async () => {
+		vi.stubGlobal(
+			"fetch",
+			vi.fn().mockResolvedValue(
+				new Response(JSON.stringify({ streams: [] }), {
+					status: 200,
+					headers: { "content-type": "application/json" },
+				}),
+			),
+		);
+		vi.stubGlobal("caches", { default: { match: vi.fn().mockResolvedValue(undefined), put: vi.fn() } });
+
+		const req = new Request("http://worker.test/stream/series/tt1234567:2:5.json");
+		const res = await handleRequest(req);
+		expect(res.status).toBe(200);
+	});
+});
+
+describe("fetchTorrentioStreams — non-JSON guard", () => {
+	afterEach(() => vi.unstubAllGlobals());
+
+	it("returns [] when Torrentio responds with HTML (text/html)", async () => {
+		vi.stubGlobal(
+			"fetch",
+			vi.fn().mockResolvedValue(
+				new Response("<html>Error</html>", {
+					status: 200,
+					headers: { "content-type": "text/html; charset=utf-8" },
+				}),
+			),
+		);
+		const result = await fetchTorrentioStreams("movie", "tt1234567");
+		expect(result).toEqual([]);
+	});
+
+	it("returns streams when Torrentio responds with application/json", async () => {
+		const streams = [{ name: "T", title: "1080p WEB-DL\n👤 100 💾 5 GB", url: "magnet:?x" }];
+		vi.stubGlobal(
+			"fetch",
+			vi.fn().mockResolvedValue(
+				new Response(JSON.stringify({ streams }), {
+					status: 200,
+					headers: { "content-type": "application/json; charset=utf-8" },
+				}),
+			),
+		);
+		const result = await fetchTorrentioStreams("movie", "tt1234567");
+		expect(result).toHaveLength(1);
+	});
+});
+
+describe("handleRequest — debug endpoint auth", () => {
+	beforeEach(() => {
+		vi.stubGlobal(
+			"fetch",
+			vi.fn().mockResolvedValue(
+				new Response(JSON.stringify({ streams: [] }), {
+					status: 200,
+					headers: { "content-type": "application/json" },
+				}),
+			),
+		);
+	});
+	afterEach(() => vi.unstubAllGlobals());
+
+	it("returns 403 when DEBUG_KEY is set and ?key is missing", async () => {
+		const req = new Request("http://worker.test/debug/movie/tt0371746");
+		const res = await handleRequest(req, undefined, { DEBUG_KEY: "secret123" });
+		expect(res.status).toBe(403);
+	});
+
+	it("returns 403 when DEBUG_KEY is set and ?key is wrong", async () => {
+		const req = new Request("http://worker.test/debug/movie/tt0371746?key=wrong");
+		const res = await handleRequest(req, undefined, { DEBUG_KEY: "secret123" });
+		expect(res.status).toBe(403);
+	});
+
+	it("returns 200 when DEBUG_KEY matches ?key", async () => {
+		const req = new Request("http://worker.test/debug/movie/tt0371746?key=secret123");
+		const res = await handleRequest(req, undefined, { DEBUG_KEY: "secret123" });
+		expect(res.status).toBe(200);
+	});
+
+	it("returns 200 when DEBUG_KEY is not set (open access)", async () => {
+		const req = new Request("http://worker.test/debug/movie/tt0371746");
+		const res = await handleRequest(req, undefined, {});
+		expect(res.status).toBe(200);
+	});
+});
+
+describe("handleRequest — TORRENTIO_URL env override", () => {
+	afterEach(() => vi.unstubAllGlobals());
+
+	it("uses TORRENTIO_DEFAULT when env.TORRENTIO_URL is not set", async () => {
+		const fetchSpy = vi.fn().mockResolvedValue(
+			new Response(JSON.stringify({ streams: [] }), {
+				status: 200,
+				headers: { "content-type": "application/json" },
+			}),
+		);
+		vi.stubGlobal("fetch", fetchSpy);
+		vi.stubGlobal("caches", { default: { match: vi.fn().mockResolvedValue(undefined), put: vi.fn() } });
+
+		const req = new Request("http://worker.test/stream/movie/tt1234567.json");
+		await handleRequest(req, undefined, {});
+		expect(fetchSpy).toHaveBeenCalledWith(
+			expect.stringContaining(TORRENTIO_DEFAULT),
+			expect.any(Object),
+		);
+	});
+
+	it("uses env.TORRENTIO_URL when set", async () => {
+		const customBase = "https://my-custom-torrentio.example.com";
+		const fetchSpy = vi.fn().mockResolvedValue(
+			new Response(JSON.stringify({ streams: [] }), {
+				status: 200,
+				headers: { "content-type": "application/json" },
+			}),
+		);
+		vi.stubGlobal("fetch", fetchSpy);
+		vi.stubGlobal("caches", { default: { match: vi.fn().mockResolvedValue(undefined), put: vi.fn() } });
+
+		const req = new Request("http://worker.test/stream/movie/tt1234567.json");
+		await handleRequest(req, undefined, { TORRENTIO_URL: customBase });
+		expect(fetchSpy).toHaveBeenCalledWith(
+			expect.stringContaining(customBase),
+			expect.any(Object),
+		);
+	});
 });
 
 // ---------------------------------------------------------------------------
@@ -615,7 +872,7 @@ describe("handleRequest — debug endpoint", () => {
 							},
 						],
 					}),
-					{ status: 200 },
+					{ status: 200, headers: { "content-type": "application/json" } },
 				),
 			),
 		);

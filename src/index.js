@@ -36,7 +36,7 @@ const MANIFEST = {
 // Constants
 // ---------------------------------------------------------------------------
 
-const TORRENTIO_BASE = "https://torrentio.withoutthefuss.dpdns.org";
+const TORRENTIO_DEFAULT = "https://torrentio.withoutthefuss.dpdns.org";
 
 /** Quality buckets — single source of truth for tier ordering. */
 const QUALITY_TIERS = ["4k", "1080p", "720p", "480p"];
@@ -98,7 +98,7 @@ const AUDIO_TYPES = [
 	{ re: /dts.?x\b/i, score: 90, label: "DTS-X" },
 	{ re: /dts.?hd.?ma/i, score: 90, label: "DTS-HD MA" },
 	{ re: /truehd/i, score: 80, label: "TrueHD" },
-	{ re: /dts.?hd/i, score: 70, label: "DTS-HD" },
+	{ re: /dts.?hd/i, score: 75, label: "DTS-HD" },
 	{ re: /\bdts\b/i, score: 70, label: "DTS" },
 	{ re: /dd\+|eac3|dolby.?digital.?plus/i, score: 60, label: "DD+" },
 	{ re: /\bac3\b|dolby.?digital|\bdd\b/i, score: 40, label: "DD" },
@@ -109,26 +109,27 @@ const AUDIO_TYPES = [
  * ENCODING SCORE
  */
 const ENCODING_TYPES = [
-	{ re: /x265|h\.?265|hevc/i, score: 30, label: "x265" },
-	{ re: /\bav1\b/i, score: 25, label: "AV1" },
-	{ re: /x264|h\.?264/i, score: 10, label: "x264" },
+	{ re: /x265|h\.?265|hevc/i, score: 50, label: "x265" },
+	{ re: /\bav1\b/i, score: 45, label: "AV1" },
+	{ re: /x264|h\.?264/i, score: 20, label: "x264" },
 ];
 
 /**
  * KNOWN QUALITY RELEASE GROUPS — bonus points
  */
 const QUALITY_GROUPS =
-	/\b(YTS|YIFY|SPARKS|FGT|ROVERS|GECKOS|DEFLATE|CMRG|NTb|FLUX|LAZY|TEPES|MZABI|TIGOLE)\b/i;
+	/\b(SPARKS|FGT|ROVERS|GECKOS|DEFLATE|CMRG|NTb|FLUX|LAZY|TEPES|MZABI|TIGOLE)\b/i;
 
 /**
  * SEEDER SCORE — logarithmic curve so seeders are a meaningful factor.
  *
- * Range: -500 (dead) → -200 (nearly dead) → ~0 (10 seeders) → 150 (500+).
+ * 0 seeders → -99999 (discarded, same as CAM/TS).
+ * Range: -200 (1-2 seeders) → ~0 (10 seeders) → 150 (500+).
  * The log curve ensures the jump from 17→229 is significant (~85 pts)
  * while 229→1000 adds diminishing returns (~33 pts).
  */
 function seederScore(n) {
-	if (n <= 0) return -500;
+	if (n <= 0) return -99999;
 	if (n < 3) return -200;
 	return Math.min(Math.round(75 * Math.log10(n) - 60), 150);
 }
@@ -370,11 +371,12 @@ function analyseStreams(rawStreams) {
 	for (const stream of rawStreams) {
 		const scored = scoreStream(stream);
 
-		if (scored.discarded) {
+		const zeroSeeders = scored.seeders === 0;
+		if (scored.discarded || zeroSeeders) {
 			discardedLog.push({
 				name: stream.name ?? "",
 				title: (stream.title ?? "").split("\n")[0],
-				reason: scored.discardReason || "score too low",
+				reason: scored.discardReason || (zeroSeeders ? "0 seeders" : "score too low"),
 				score: scored.total,
 			});
 			continue;
@@ -433,8 +435,8 @@ function selectBestStreams(rawStreams) {
  * Fetches streams from Torrentio for a given type + id.
  * Returns an empty array on any error — the Worker must never crash.
  */
-async function fetchTorrentioStreams(type, id) {
-	const url = `${TORRENTIO_BASE}/stream/${type}/${id}.json`;
+async function fetchTorrentioStreams(type, id, torrentioBase = TORRENTIO_DEFAULT) {
+	const url = `${torrentioBase}/stream/${type}/${id}.json`;
 
 	try {
 		const response = await fetch(url, {
@@ -443,6 +445,12 @@ async function fetchTorrentioStreams(type, id) {
 
 		if (!response.ok) {
 			console.error(`Torrentio returned ${response.status} for ${url}`);
+			return [];
+		}
+
+		const contentType = response.headers.get("content-type") ?? "";
+		if (!contentType.includes("application/json")) {
+			console.error(`Torrentio returned non-JSON content-type "${contentType}" for ${url}`);
 			return [];
 		}
 
@@ -492,8 +500,9 @@ function notFound() {
  *   OPTIONS *  (CORS pre-flight)
  *   GET  /  (redirect → /manifest.json)
  */
-async function handleRequest(request, ctx) {
-	const { pathname } = new URL(request.url);
+async function handleRequest(request, ctx, env = {}) {
+	const { pathname, searchParams } = new URL(request.url);
+	const torrentioBase = env.TORRENTIO_URL ?? TORRENTIO_DEFAULT;
 
 	if (request.method === "OPTIONS") {
 		return new Response(null, { status: 204, headers: CORS_HEADERS });
@@ -524,9 +533,27 @@ async function handleRequest(request, ctx) {
 		const cached = await cache.match(cacheKey);
 		if (cached) return cached;
 
-		const ttl = type === "movie" ? 7200 : 3600;
-		const rawStreams = await fetchTorrentioStreams(type, id);
+		// Validate IMDB id format — rejects junk before hitting Torrentio
+		if (!/^tt\d+(:\d+:\d+)?$/.test(id)) {
+			return jsonResponse({ streams: [] }, 200, 60);
+		}
+
+		const rawStreams = await fetchTorrentioStreams(type, id, torrentioBase);
 		const streams = selectBestStreams(rawStreams);
+
+		// Adaptive TTL:
+		// - 0 streams (Torrentio failed/429): cache 2 min to stop hammering
+		// - < 3 streams (new release, few torrents yet): cache 10 min
+		// - normal: full TTL (movies 2h, series 1h)
+		let ttl;
+		if (streams.length === 0) {
+			ttl = 120;
+		} else if (streams.length < 3) {
+			ttl = 600;
+		} else {
+			ttl = type === "movie" ? 7200 : 3600;
+		}
+
 		const response = jsonResponse({ streams }, 200, ttl);
 
 		// Store in edge cache asynchronously — does not block the response
@@ -540,8 +567,12 @@ async function handleRequest(request, ctx) {
 	// Example: GET /debug/movie/tt0371746
 	const debugMatch = pathname.match(/^\/debug\/(movie|series)\/([^/]+)$/);
 	if (debugMatch) {
+		const debugKey = env.DEBUG_KEY;
+		if (debugKey && searchParams.get("key") !== debugKey) {
+			return new Response("Forbidden", { status: 403, headers: CORS_HEADERS });
+		}
 		const [, type, id] = debugMatch;
-		const rawStreams = await fetchTorrentioStreams(type, id);
+		const rawStreams = await fetchTorrentioStreams(type, id, torrentioBase);
 		const { debugInfo } = analyseStreams(rawStreams);
 		return jsonResponse(debugInfo, 200, 0, true);
 	}
@@ -562,8 +593,8 @@ async function handleRequest(request, ctx) {
 // ---------------------------------------------------------------------------
 
 export default {
-	async fetch(request, _env, ctx) {
-		return handleRequest(request, ctx);
+	async fetch(request, env, ctx) {
+		return handleRequest(request, ctx, env);
 	},
 };
 
