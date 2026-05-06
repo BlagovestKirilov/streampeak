@@ -172,7 +172,7 @@ function detectLanguage(text) {
  * "480p" | null).
  */
 function detectQuality(text) {
-	if (/2160p|4k|uhd/i.test(text)) return "4k";
+	if (/2160p|\b4k\b|uhd/i.test(text)) return "4k";
 	if (/1080p/i.test(text)) return "1080p";
 	if (/720p/i.test(text)) return "720p";
 	if (/480p|\bsd\b/i.test(text)) return "480p";

@@ -34,6 +34,7 @@ describe("detectQuality", () => {
 		["720p WEBRip", "720p"],
 		["480p DVDRip", "480p"],
 		["No resolution info", null],
+		["[Bluray 720p] ⚙️ Wolfmax4k", "720p"],
 	])('detectQuality("%s") === %s', (text, expected) => {
 		expect(detectQuality(text)).toBe(expected);
 	});
