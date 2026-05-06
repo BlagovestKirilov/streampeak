@@ -708,16 +708,16 @@ describe("handleRequest — caching", () => {
 
 	afterEach(() => vi.unstubAllGlobals());
 
-	it("movie stream response has Cache-Control max-age=7200", async () => {
+	it("movie stream response has Cache-Control max-age=28800", async () => {
 		const req = new Request("http://worker.test/stream/movie/tt0468569.json");
 		const res = await handleRequest(req);
-		expect(res.headers.get("Cache-Control")).toBe("public, max-age=7200");
+		expect(res.headers.get("Cache-Control")).toBe("public, max-age=28800");
 	});
 
-	it("series stream response has Cache-Control max-age=3600", async () => {
+	it("series stream response has Cache-Control max-age=28800", async () => {
 		const req = new Request("http://worker.test/stream/series/tt0903747:1:1.json");
 		const res = await handleRequest(req);
-		expect(res.headers.get("Cache-Control")).toBe("public, max-age=3600");
+		expect(res.headers.get("Cache-Control")).toBe("public, max-age=28800");
 	});
 
 	it("returns cached response when cache hits and does not call Torrentio", async () => {
@@ -768,7 +768,7 @@ describe("handleRequest — caching", () => {
 		expect(res.headers.get("Cache-Control")).toBe("public, max-age=120");
 	});
 
-	it("uses 10-minute TTL when fewer than 3 streams (new release)", async () => {
+	it("uses 10-minute TTL when fewer than 2 streams (new release)", async () => {
 		const sparse = [
 			{ name: "T", title: "1080p WEB-DL\n👤 50 💾 6 GB ⚙ S", url: "magnet:?a" },
 		];

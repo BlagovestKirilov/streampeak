@@ -564,31 +564,33 @@ async function handleRequest(request, ctx, env = {}) {
 	if (streamMatch) {
 		const [, type, id] = streamMatch;
 
-		// Check Cloudflare edge cache first
-		const cache = caches.default;
-		const cacheKey = new Request(request.url);
-		const cached = await cache.match(cacheKey);
-		if (cached) return cached;
-
-		// Validate IMDB id format — rejects junk before hitting Torrentio
+		// Validate IMDB id format first — rejects junk without touching the cache
 		if (!/^tt\d+(:\d+:\d+)?$/.test(id)) {
 			return jsonResponse({ streams: [] }, 200, 60);
 		}
+
+		// Normalise cache key to path-only so ?query variants share one entry
+		const cache = caches.default;
+		const cacheKey = new Request(
+			`${new URL(request.url).origin}/stream/${type}/${id}.json`,
+		);
+		const cached = await cache.match(cacheKey);
+		if (cached) return cached;
 
 		const rawStreams = await fetchTorrentioStreams(type, id, torrentioBase);
 		const streams = selectBestStreams(rawStreams);
 
 		// Adaptive TTL:
 		// - 0 streams (Torrentio failed/429): cache 2 min to stop hammering
-		// - < 3 streams (new release, few torrents yet): cache 10 min
-		// - normal: full TTL (movies 2h, series 1h)
+		// - < 2 streams (new release, only 1 result): cache 10 min
+		// - normal: full TTL (movies 8h, series 8h)
 		let ttl;
 		if (streams.length === 0) {
 			ttl = 120;
-		} else if (streams.length < 3) {
+		} else if (streams.length < 2) {
 			ttl = 600;
 		} else {
-			ttl = type === "movie" ? 7200 : 3600;
+			ttl = 28800;
 		}
 
 		const response = jsonResponse({ streams }, 200, ttl);
