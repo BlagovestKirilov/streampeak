@@ -1195,6 +1195,18 @@ describe("handleRequest — stream endpoint", () => {
 		const body = await res.json();
 		expect(Array.isArray(body.streams)).toBe(true);
 	});
+
+	it("GET /stream/series/:id.json works with percent-encoded colons", async () => {
+		const req = new Request(
+			"http://worker.test/stream/series/tt1234567%3A1%3A2.json",
+		);
+		const res = await handleRequest(req);
+
+		expect(res.status).toBe(200);
+		const body = await res.json();
+		expect(Array.isArray(body.streams)).toBe(true);
+		expect(body.streams.length).toBeGreaterThan(0);
+	});
 });
 
 // ---------------------------------------------------------------------------

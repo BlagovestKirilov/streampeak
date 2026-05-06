@@ -742,13 +742,13 @@ async function handleRequest(request, ctx, env = {}) {
 	const streamMatch = /^\/stream\/(movie|series)\/([^/]+)\.json$/.exec(pathname);
 	if (streamMatch) {
 		const [, type, id] = streamMatch;
-		return handleStreamRoute(request, ctx, type, id, torrentioBase);
+		return handleStreamRoute(request, ctx, type, decodeURIComponent(id), torrentioBase);
 	}
 
 	const debugMatch = /^\/debug\/(movie|series)\/([^/]+)$/.exec(pathname);
 	if (debugMatch) {
 		const [, type, id] = debugMatch;
-		return handleDebugRoute(searchParams, type, id, torrentioBase, env.DEBUG_KEY);
+		return handleDebugRoute(searchParams, type, decodeURIComponent(id), torrentioBase, env.DEBUG_KEY);
 	}
 
 	if (pathname === "/" || pathname === "") {
