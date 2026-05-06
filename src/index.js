@@ -70,6 +70,7 @@ const RESOLUTION_SCORES = {
  * We still score them so the debug endpoint can show the discard reason.
  */
 const RELEASE_TYPE = [
+	{ re: /\bremux\b/i, score: 350, label: "REMUX" },
 	{ re: /blu.?ray|bdrip|bdremux/i, score: 400, label: "BluRay" },
 	{ re: /web.?dl/i, score: 300, label: "WEB-DL" },
 	{ re: /webrip/i, score: 200, label: "WEBRip" },
@@ -83,8 +84,10 @@ const RELEASE_TYPE = [
 
 /**
  * HDR SCORE
+ * DV+HDR dual-layer (plays on both DV and HDR displays) is the best.
  */
 const HDR_TYPES = [
+	{ re: /(?=.*(?:dolby.?vision|\bdovi\b))(?=.*\bhdr\b)/i, score: 170, label: "DV HDR" },
 	{ re: /hdr10\+|hdr10plus/i, score: 150, label: "HDR10+" },
 	{ re: /dolby.?vision|\bdovi\b/i, score: 120, label: "DV" },
 	{ re: /\bhdr\b/i, score: 100, label: "HDR" },
@@ -209,6 +212,50 @@ function extractSizeMB(title) {
 }
 
 // ---------------------------------------------------------------------------
+// Size scoring
+// ---------------------------------------------------------------------------
+
+/**
+ * SIZE PREFERENCE SCORING
+ *
+ * Ideal ranges (sweet spot = full bonus):
+ *   4K:    5–25 GB  → +75
+ *   1080p: 2–10 GB  → +75
+ *   720p:  0.5–4 GB → +50
+ *   480p:  any       → 0
+ *
+ * Too small (likely fake / sample):   hard penalty
+ * Too large (will buffer):            escalating penalty, worse for remuxes
+ * Unknown size (0):                   neutral (0)
+ */
+function calcSizeScore(quality, sizeMB, isRemux = false) {
+	if (sizeMB <= 0) return 0;
+
+	const sizeGB = sizeMB / 1024;
+
+	if (quality === "4k") {
+		if (sizeGB < 4) return -500;          // too small — fake / sample
+		if (sizeGB <= 25) return 75;           // sweet spot
+		if (sizeGB <= 40) return 25;           // acceptable large encode
+		return isRemux ? -300 : -100;          // oversized, harsher for remux
+	}
+	if (quality === "1080p") {
+		if (sizeMB < 500) return -500;         // too small
+		if (sizeGB <= 10) return 75;           // sweet spot
+		if (sizeGB <= 20) return 25;           // acceptable
+		return isRemux ? -300 : -100;          // oversized
+	}
+	if (quality === "720p") {
+		if (sizeMB < 200) return -200;         // too small
+		if (sizeGB <= 4) return 50;            // sweet spot
+		if (sizeGB <= 8) return 25;            // acceptable
+		return isRemux ? -200 : -50;           // oversized
+	}
+
+	return 0; // 480p — no size preference
+}
+
+// ---------------------------------------------------------------------------
 // Core scoring engine
 // ---------------------------------------------------------------------------
 
@@ -222,7 +269,7 @@ function extractSizeMB(title) {
  *   discarded: boolean,      // true when CAM/TS penalty applied
  *   discardReason: string,   // e.g. "CAM" (only set when discarded)
  *   breakdown: {             // individual score components
- *     resolution, releaseType, hdr, audio, encoding, seeders, sizePenalty, groupBonus
+ *     resolution, releaseType, hdr, audio, encoding, seeders, sizeScore, groupBonus
  *   },
  *   labels: {                // human-readable detected values for stream naming
  *     releaseType, hdr, audio, encoding
@@ -297,17 +344,12 @@ function scoreStream(stream) {
 	const seeders = extractSeeders(title);
 	const seederPts = seederScore(seeders);
 
-	// ── File size sanity check ────────────────────────────────────────────────
-	// A wildly small file for the claimed resolution is almost certainly
-	// mislabelled or a sample — penalise it.
+	// ── File size scoring ────────────────────────────────────────────────────
+	// Rewards ideal size ranges and penalises suspiciously small or
+	// oversized files (e.g. remuxes that will buffer on most connections).
+	const isRemux = /\bremux\b/i.test(combined);
 	const sizeMB = extractSizeMB(title);
-	let sizePenalty = 0;
-
-	if (sizeMB > 0) {
-		if (quality === "4k" && sizeMB < 4 * 1024) sizePenalty = -500;
-		else if (quality === "1080p" && sizeMB < 500) sizePenalty = -500;
-		else if (quality === "720p" && sizeMB < 200) sizePenalty = -200;
-	}
+	const sizeScore = calcSizeScore(quality, sizeMB, isRemux);
 
 	// ── Release-group bonus ───────────────────────────────────────────────────
 	const groupBonus = QUALITY_GROUPS.test(combined) ? 50 : 0;
@@ -325,7 +367,7 @@ function scoreStream(stream) {
 		audioPts +
 		encodingPts +
 		seederPts +
-		sizePenalty +
+		sizeScore +
 		groupBonus +
 		languagePts;
 
@@ -341,7 +383,7 @@ function scoreStream(stream) {
 			audio: audioPts,
 			encoding: encodingPts,
 			seeders: seederPts,
-			sizePenalty,
+			sizeScore,
 			groupBonus,
 			language: languagePts,
 		},
@@ -642,6 +684,7 @@ export default {
 // ---------------------------------------------------------------------------
 
 export {
+	calcSizeScore,
 	detectLanguage,
 	detectQuality,
 	extractSeeders,

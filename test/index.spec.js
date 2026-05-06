@@ -5,6 +5,7 @@ import {
 } from "cloudflare:test";
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import worker, {
+	calcSizeScore,
 	detectLanguage,
 	detectQuality,
 	extractSeeders,
@@ -150,6 +151,84 @@ describe("seederScore", () => {
 });
 
 // ---------------------------------------------------------------------------
+// calcSizeScore
+// ---------------------------------------------------------------------------
+
+describe("calcSizeScore", () => {
+	// 4K
+	it("4K too small (<4 GB) → -500", () => {
+		expect(calcSizeScore("4k", 2.5 * 1024)).toBe(-500);
+	});
+
+	it("4K sweet spot (5–25 GB) → +75", () => {
+		expect(calcSizeScore("4k", 15 * 1024)).toBe(75);
+	});
+
+	it("4K acceptable (25–40 GB) → +25", () => {
+		expect(calcSizeScore("4k", 35 * 1024)).toBe(25);
+	});
+
+	it("4K oversized (>40 GB encode) → -100", () => {
+		expect(calcSizeScore("4k", 50 * 1024)).toBe(-100);
+	});
+
+	it("4K oversized remux (>40 GB) → -300", () => {
+		expect(calcSizeScore("4k", 65 * 1024, true)).toBe(-300);
+	});
+
+	// 1080p
+	it("1080p too small (<500 MB) → -500", () => {
+		expect(calcSizeScore("1080p", 300)).toBe(-500);
+	});
+
+	it("1080p sweet spot (2–10 GB) → +75", () => {
+		expect(calcSizeScore("1080p", 6 * 1024)).toBe(75);
+	});
+
+	it("1080p acceptable (10–20 GB) → +25", () => {
+		expect(calcSizeScore("1080p", 15 * 1024)).toBe(25);
+	});
+
+	it("1080p oversized (>20 GB encode) → -100", () => {
+		expect(calcSizeScore("1080p", 25 * 1024)).toBe(-100);
+	});
+
+	it("1080p oversized remux (>20 GB) → -300", () => {
+		expect(calcSizeScore("1080p", 30 * 1024, true)).toBe(-300);
+	});
+
+	// 720p
+	it("720p too small (<200 MB) → -200", () => {
+		expect(calcSizeScore("720p", 150)).toBe(-200);
+	});
+
+	it("720p sweet spot (0.5–4 GB) → +50", () => {
+		expect(calcSizeScore("720p", 2 * 1024)).toBe(50);
+	});
+
+	it("720p acceptable (4–8 GB) → +25", () => {
+		expect(calcSizeScore("720p", 6 * 1024)).toBe(25);
+	});
+
+	it("720p oversized (>8 GB) → -50", () => {
+		expect(calcSizeScore("720p", 10 * 1024)).toBe(-50);
+	});
+
+	it("720p oversized remux → -200", () => {
+		expect(calcSizeScore("720p", 12 * 1024, true)).toBe(-200);
+	});
+
+	// Edge cases
+	it("unknown size (0) → 0", () => {
+		expect(calcSizeScore("4k", 0)).toBe(0);
+	});
+
+	it("480p → always 0", () => {
+		expect(calcSizeScore("480p", 5 * 1024)).toBe(0);
+	});
+});
+
+// ---------------------------------------------------------------------------
 // scoreStream
 // ---------------------------------------------------------------------------
 
@@ -179,13 +258,13 @@ describe("scoreStream", () => {
 		expect(s.discarded).toBe(true);
 		expect(s.discardReason).toBe("CAM");
 		expect(s.breakdown.releaseType).toBe(-99999);
-		expect(s.total).toBeLessThan(-99000);
+		expect(s.total).toBeLessThan(-98000);
 	});
 
 	it("marks TS stream as discarded", () => {
 		const s = scoreStream(make("Torrentio", "720p TS\n👤 999 💾 1 GB ⚙ Source"));
 		expect(s.discarded).toBe(true);
-		expect(s.total).toBeLessThan(-99000);
+		expect(s.total).toBeLessThan(-98000);
 	});
 
 	it("marks HDCAM stream as discarded", () => {
@@ -202,28 +281,28 @@ describe("scoreStream", () => {
 		const s = scoreStream(
 			make("Torrentio", "4K UHD WEB-DL\n👤 200 💾 2.5 GB ⚙ Source"),
 		);
-		expect(s.breakdown.sizePenalty).toBe(-500);
+		expect(s.breakdown.sizeScore).toBe(-500);
 	});
 
 	it("applies size penalty for mislabeled 1080p stream (< 500 MB)", () => {
 		const s = scoreStream(
 			make("Torrentio", "1080p WEB-DL\n👤 200 💾 300 MB ⚙ Source"),
 		);
-		expect(s.breakdown.sizePenalty).toBe(-500);
+		expect(s.breakdown.sizeScore).toBe(-500);
 	});
 
 	it("applies size penalty for mislabeled 720p stream (< 200 MB)", () => {
 		const s = scoreStream(
 			make("Torrentio", "720p WEBRip\n👤 100 💾 150 MB ⚙ Source"),
 		);
-		expect(s.breakdown.sizePenalty).toBe(-200);
+		expect(s.breakdown.sizeScore).toBe(-200);
 	});
 
 	it("does NOT apply size penalty when size is 0 (unknown)", () => {
 		const s = scoreStream(
 			make("Torrentio", "4K BluRay\n👤 342 ⚙ Source"),
 		);
-		expect(s.breakdown.sizePenalty).toBe(0);
+		expect(s.breakdown.sizeScore).toBe(0);
 	});
 
 	it("applies group bonus for known release groups", () => {
@@ -269,6 +348,74 @@ describe("scoreStream", () => {
 		);
 		expect(s.labels.hdr).toBe("DV");
 		expect(s.breakdown.hdr).toBe(120);
+	});
+
+	it("detects DV+HDR dual-layer combo → 170 pts", () => {
+		const s = scoreStream(
+			make("Torrentio", "4K BluRay Dolby Vision HDR\n👤 200 💾 20 GB ⚙ Source"),
+		);
+		expect(s.labels.hdr).toBe("DV HDR");
+		expect(s.breakdown.hdr).toBe(170);
+	});
+
+	it("detects DV+HDR with DoVi abbreviation", () => {
+		const s = scoreStream(
+			make("Torrentio", "4K WEB-DL DoVi HDR\n👤 200 💾 20 GB ⚙ Source"),
+		);
+		expect(s.labels.hdr).toBe("DV HDR");
+		expect(s.breakdown.hdr).toBe(170);
+	});
+
+	it("DV+HDR scores higher than HDR10+ alone", () => {
+		const dvHdr = scoreStream(
+			make("Torrentio", "4K BluRay Dolby Vision HDR x265\n👤 200 💾 20 GB ⚙ Source"),
+		);
+		const hdr10 = scoreStream(
+			make("Torrentio", "4K BluRay HDR10+ x265\n👤 200 💾 20 GB ⚙ Source"),
+		);
+		expect(dvHdr.breakdown.hdr).toBeGreaterThan(hdr10.breakdown.hdr);
+	});
+
+	it("detects REMUX release type → 350 pts", () => {
+		const s = scoreStream(
+			make("Torrentio", "4K Remux Atmos\n👤 200 💾 60 GB ⚙ Source"),
+		);
+		expect(s.labels.releaseType).toBe("REMUX");
+		expect(s.breakdown.releaseType).toBe(350);
+	});
+
+	it("REMUX gets harsher size penalty than encode when oversized", () => {
+		const remux = scoreStream(
+			make("Torrentio", "4K Remux Atmos\n👤 200 💾 65 GB ⚙ Source"),
+		);
+		const encode = scoreStream(
+			make("Torrentio", "4K BluRay Atmos x265\n👤 200 💾 65 GB ⚙ Source"),
+		);
+		expect(remux.breakdown.sizeScore).toBeLessThan(encode.breakdown.sizeScore);
+	});
+
+	it("sweet-spot 4K encode gets +75 sizeScore", () => {
+		const s = scoreStream(
+			make("Torrentio", "4K BluRay x265\n👤 200 💾 15 GB ⚙ Source"),
+		);
+		expect(s.breakdown.sizeScore).toBe(75);
+	});
+
+	it("sweet-spot 1080p encode gets +75 sizeScore", () => {
+		const s = scoreStream(
+			make("Torrentio", "1080p WEB-DL x265\n👤 200 💾 6 GB ⚙ Source"),
+		);
+		expect(s.breakdown.sizeScore).toBe(75);
+	});
+
+	it("sweet-spot 1080p beats oversized 1080p remux", () => {
+		const sweet = scoreStream(
+			make("Torrentio", "1080p BluRay x265\n👤 200 💾 8 GB ⚙ Source"),
+		);
+		const remux = scoreStream(
+			make("Torrentio", "1080p Remux DTS-HD MA\n👤 200 💾 30 GB ⚙ Source"),
+		);
+		expect(sweet.total).toBeGreaterThan(remux.total);
 	});
 
 	it("detects DTS-HD MA audio", () => {
