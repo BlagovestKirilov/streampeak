@@ -1024,6 +1024,101 @@ describe("fetchTorrentioStreams — non-JSON guard", () => {
 	});
 });
 
+describe("fetchTorrentioStreams — fallback to secondary", () => {
+	afterEach(() => vi.unstubAllGlobals());
+
+	it("falls back to secondary when primary returns 500", async () => {
+		const streams = [{ name: "T", title: "1080p\n👤 50 💾 5 GB", url: "magnet:?x" }];
+		const fetchSpy = vi.fn()
+			.mockResolvedValueOnce(new Response("Internal Server Error", { status: 500 }))
+			.mockResolvedValueOnce(
+				new Response(JSON.stringify({ streams }), {
+					status: 200,
+					headers: { "content-type": "application/json" },
+				}),
+			);
+		vi.stubGlobal("fetch", fetchSpy);
+
+		const result = await fetchTorrentioStreams("movie", "tt1234567");
+		expect(fetchSpy).toHaveBeenCalledTimes(2);
+		expect(fetchSpy.mock.calls[0][0]).toContain("withoutthefuss");
+		expect(fetchSpy.mock.calls[1][0]).toContain("strem.fun");
+		expect(result).toHaveLength(1);
+	});
+
+	it("falls back to secondary when primary throws (timeout/network error)", async () => {
+		const streams = [{ name: "T", title: "720p\n👤 30 💾 2 GB", url: "magnet:?y" }];
+		const fetchSpy = vi.fn()
+			.mockRejectedValueOnce(new Error("timeout"))
+			.mockResolvedValueOnce(
+				new Response(JSON.stringify({ streams }), {
+					status: 200,
+					headers: { "content-type": "application/json" },
+				}),
+			);
+		vi.stubGlobal("fetch", fetchSpy);
+
+		const result = await fetchTorrentioStreams("movie", "tt1234567");
+		expect(fetchSpy).toHaveBeenCalledTimes(2);
+		expect(result).toHaveLength(1);
+	});
+
+	it("falls back to secondary when primary returns non-JSON", async () => {
+		const streams = [{ name: "T", title: "1080p\n👤 100 💾 8 GB", url: "magnet:?z" }];
+		const fetchSpy = vi.fn()
+			.mockResolvedValueOnce(
+				new Response("<html>Blocked</html>", {
+					status: 200,
+					headers: { "content-type": "text/html" },
+				}),
+			)
+			.mockResolvedValueOnce(
+				new Response(JSON.stringify({ streams }), {
+					status: 200,
+					headers: { "content-type": "application/json" },
+				}),
+			);
+		vi.stubGlobal("fetch", fetchSpy);
+
+		const result = await fetchTorrentioStreams("movie", "tt1234567");
+		expect(fetchSpy).toHaveBeenCalledTimes(2);
+		expect(result).toHaveLength(1);
+	});
+
+	it("returns [] when both primary and secondary fail", async () => {
+		const fetchSpy = vi.fn().mockRejectedValue(new Error("Network error"));
+		vi.stubGlobal("fetch", fetchSpy);
+
+		const result = await fetchTorrentioStreams("movie", "tt1234567");
+		expect(fetchSpy).toHaveBeenCalledTimes(2);
+		expect(result).toEqual([]);
+	});
+
+	it("does NOT try fallback when primary succeeds", async () => {
+		const streams = [{ name: "T", title: "4K\n👤 200 💾 20 GB", url: "magnet:?ok" }];
+		const fetchSpy = vi.fn().mockResolvedValue(
+			new Response(JSON.stringify({ streams }), {
+				status: 200,
+				headers: { "content-type": "application/json" },
+			}),
+		);
+		vi.stubGlobal("fetch", fetchSpy);
+
+		const result = await fetchTorrentioStreams("movie", "tt1234567");
+		expect(fetchSpy).toHaveBeenCalledTimes(1);
+		expect(result).toHaveLength(1);
+	});
+
+	it("does NOT add fallback if torrentioBase is already the fallback URL", async () => {
+		const fetchSpy = vi.fn().mockRejectedValue(new Error("fail"));
+		vi.stubGlobal("fetch", fetchSpy);
+
+		const result = await fetchTorrentioStreams("movie", "tt1234567", "https://torrentio.strem.fun");
+		expect(fetchSpy).toHaveBeenCalledTimes(1);
+		expect(result).toEqual([]);
+	});
+});
+
 describe("handleRequest — debug endpoint auth", () => {
 	beforeEach(() => {
 		vi.stubGlobal(

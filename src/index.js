@@ -37,6 +37,7 @@ const MANIFEST = {
 // ---------------------------------------------------------------------------
 
 const TORRENTIO_DEFAULT = "https://torrentio.withoutthefuss.dpdns.org";
+const TORRENTIO_FALLBACK = "https://torrentio.strem.fun";
 
 /** Quality buckets — single source of truth for tier ordering. */
 const QUALITY_TIERS = ["4k", "1080p", "720p", "480p"];
@@ -512,33 +513,42 @@ function selectBestStreams(rawStreams) {
 
 /**
  * Fetches streams from Torrentio for a given type + id.
- * Returns an empty array on any error — the Worker must never crash.
+ * Tries the primary instance first; on failure (5xx, timeout, non-JSON),
+ * falls back to the secondary instance.
+ * Returns an empty array only if both fail — the Worker must never crash.
  */
 async function fetchTorrentioStreams(type, id, torrentioBase = TORRENTIO_DEFAULT) {
-	const url = `${torrentioBase}/stream/${type}/${id}.json`;
+	const path = `/stream/${type}/${id}.json`;
+	const bases = [torrentioBase];
+	if (torrentioBase !== TORRENTIO_FALLBACK) bases.push(TORRENTIO_FALLBACK);
 
-	try {
-		const response = await fetch(url, {
-			signal: AbortSignal.timeout(10_000),
-		});
+	for (const base of bases) {
+		const url = `${base}${path}`;
+		try {
+			const response = await fetch(url, {
+				signal: AbortSignal.timeout(8_000),
+			});
 
-		if (!response.ok) {
-			console.error(`Torrentio returned ${response.status} for ${url}`);
-			return [];
+			if (!response.ok) {
+				console.error(`Torrentio returned ${response.status} for ${url}`);
+				continue;
+			}
+
+			const contentType = response.headers.get("content-type") ?? "";
+			if (!contentType.includes("application/json")) {
+				console.error(`Torrentio returned non-JSON content-type "${contentType}" for ${url}`);
+				continue;
+			}
+
+			const data = await response.json();
+			return Array.isArray(data.streams) ? data.streams : [];
+		} catch (err) {
+			console.error(`Failed to fetch from Torrentio (${base}): ${err.message}`);
+			continue;
 		}
-
-		const contentType = response.headers.get("content-type") ?? "";
-		if (!contentType.includes("application/json")) {
-			console.error(`Torrentio returned non-JSON content-type "${contentType}" for ${url}`);
-			return [];
-		}
-
-		const data = await response.json();
-		return Array.isArray(data.streams) ? data.streams : [];
-	} catch (err) {
-		console.error(`Failed to fetch from Torrentio: ${err.message}`);
-		return [];
 	}
+
+	return [];
 }
 
 // ---------------------------------------------------------------------------
