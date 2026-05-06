@@ -39,6 +39,9 @@ const MANIFEST = {
 const TORRENTIO_DEFAULT = "https://torrentio.withoutthefuss.dpdns.org";
 const TORRENTIO_FALLBACK = "https://torrentio.strem.fun";
 
+/** Minimum seeder count — streams below this are discarded as unhealthy. */
+const MIN_SEEDERS = 5;
+
 /** Quality buckets — single source of truth for tier ordering. */
 const QUALITY_TIERS = ["4k", "1080p", "720p", "480p"];
 
@@ -132,9 +135,18 @@ const LANGUAGE_SCORE = [
 	// Non-English flag emoji block U+1F1E6–U+1F1FF covers all country flags.
 	// We match any flag pair NOT already matched above as non-English.
 	{ re: /[\u{1F1E6}-\u{1F1FF}]{2}/u, score: -200, label: "non-EN" },
-	// Explicit language words that are clearly non-English
-	{ re: /\b(french|spanish|german|italian|portuguese|russian|hindi|arabic|turkish|korean|japanese|chinese|dutch|polish|swedish|norwegian|danish|finnish|romanian|hungarian|bulgarian|greek|hebrew|thai|vietnamese|ukrainian|czech|slovak|croatian|serbian|slovenian|latvian|lithuanian|estonian|persian|indonesian|malay)\b/i, score: -200, label: "non-EN" },
 ];
+
+/** Explicit non-English language words — checked via Set to avoid regex complexity limits. */
+const NON_ENGLISH_LANGUAGES = new Set([
+	"french", "spanish", "german", "italian", "portuguese", "russian",
+	"hindi", "arabic", "turkish", "korean", "japanese", "chinese",
+	"dutch", "polish", "swedish", "norwegian", "danish", "finnish",
+	"romanian", "hungarian", "bulgarian", "greek", "hebrew", "thai",
+	"vietnamese", "ukrainian", "czech", "slovak", "croatian", "serbian",
+	"slovenian", "latvian", "lithuanian", "estonian", "persian",
+	"indonesian", "malay",
+]);
 
 /**
  * KNOWN QUALITY RELEASE GROUPS — bonus points
@@ -168,6 +180,10 @@ function detectLanguage(text) {
 	for (const { re, score, label } of LANGUAGE_SCORE) {
 		if (re.test(text)) return { score, label };
 	}
+	const words = text.toLowerCase().match(/\b[a-z]+\b/g) ?? [];
+	if (words.some((w) => NON_ENGLISH_LANGUAGES.has(w))) {
+		return { score: -200, label: "non-EN" };
+	}
 	return { score: 0, label: "" };
 }
 
@@ -189,11 +205,11 @@ function detectQuality(text) {
  * Returns 0 when nothing is found.
  */
 function extractSeeders(title) {
-	const emojiMatch = title.match(/\u{1F464}\s*(\d+)/u);
-	if (emojiMatch) return parseInt(emojiMatch[1], 10);
+	const emojiMatch = /\u{1F464}\s*(\d+)/u.exec(title);
+	if (emojiMatch) return Number.parseInt(emojiMatch[1], 10);
 
-	const seedsMatch = title.match(/seeds?[:\s]+(\d+)/i);
-	if (seedsMatch) return parseInt(seedsMatch[1], 10);
+	const seedsMatch = /seeds?[:\s]+(\d+)/i.exec(title);
+	if (seedsMatch) return Number.parseInt(seedsMatch[1], 10);
 
 	return 0;
 }
@@ -204,10 +220,10 @@ function extractSeeders(title) {
  */
 function extractSizeMB(title) {
 	// 💾 is U+1F4BE
-	const match = title.match(/\u{1F4BE}\s*([\d.]+)\s*(MB|GB)/iu);
+	const match = /\u{1F4BE}\s*([\d.]+)\s*(MB|GB)/iu.exec(title);
 	if (!match) return 0;
 
-	const value = parseFloat(match[1]);
+	const value = Number.parseFloat(match[1]);
 	const unit = match[2].toUpperCase();
 	return unit === "GB" ? value * 1024 : value;
 }
@@ -229,31 +245,28 @@ function extractSizeMB(title) {
  * Too large (will buffer):            escalating penalty, worse for remuxes
  * Unknown size (0):                   neutral (0)
  */
+/**
+ * Per-quality size tiers:
+ * [ minMB, sweetMaxGB, acceptMaxGB, sweetPts, acceptPts, tooSmallPts, overRemux, overNormal ]
+ */
+const SIZE_TIERS = {
+	"4k":    [4096,  25, 40, 75, 25, -500, -300, -100],
+	"1080p": [ 500,  10, 20, 75, 25, -500, -300, -100],
+	"720p":  [ 200,   4,  8, 50, 25, -200, -200,  -50],
+};
+
 function calcSizeScore(quality, sizeMB, isRemux = false) {
 	if (sizeMB <= 0) return 0;
+	const tier = SIZE_TIERS[quality];
+	if (!tier) return 0; // 480p — no size preference
 
+	const [minMB, sweetMaxGB, acceptMaxGB, sweetPts, acceptPts, tooSmallPts, overRemux, overNormal] = tier;
 	const sizeGB = sizeMB / 1024;
 
-	if (quality === "4k") {
-		if (sizeGB < 4) return -500;          // too small — fake / sample
-		if (sizeGB <= 25) return 75;           // sweet spot
-		if (sizeGB <= 40) return 25;           // acceptable large encode
-		return isRemux ? -300 : -100;          // oversized, harsher for remux
-	}
-	if (quality === "1080p") {
-		if (sizeMB < 500) return -500;         // too small
-		if (sizeGB <= 10) return 75;           // sweet spot
-		if (sizeGB <= 20) return 25;           // acceptable
-		return isRemux ? -300 : -100;          // oversized
-	}
-	if (quality === "720p") {
-		if (sizeMB < 200) return -200;         // too small
-		if (sizeGB <= 4) return 50;            // sweet spot
-		if (sizeGB <= 8) return 25;            // acceptable
-		return isRemux ? -200 : -50;           // oversized
-	}
-
-	return 0; // 480p — no size preference
+	if (sizeMB < minMB) return tooSmallPts;
+	if (sizeGB <= sweetMaxGB) return sweetPts;
+	if (sizeGB <= acceptMaxGB) return acceptPts;
+	return isRemux ? overRemux : overNormal;
 }
 
 // ---------------------------------------------------------------------------
@@ -279,98 +292,43 @@ function calcSizeScore(quality, sizeMB, isRemux = false) {
  *   sizeMB: number,
  * }
  */
+/**
+ * Finds the first matching entry in a scored list and returns { score, label }.
+ * Returns { score: 0, label: fallbackLabel } when nothing matches.
+ */
+function detectFirst(list, text, fallbackLabel = "") {
+	for (const { re, score, label } of list) {
+		if (re.test(text)) return { score, label };
+	}
+	return { score: 0, label: fallbackLabel };
+}
+
 function scoreStream(stream) {
 	const combined = `${stream.name ?? ""} ${stream.title ?? ""}`;
 	const title = stream.title ?? "";
 
-	// ── Resolution ───────────────────────────────────────────────────────────
 	const quality = detectQuality(combined);
 	const resolutionPts = RESOLUTION_SCORES[quality] ?? 0;
 
-	// ── Release type ─────────────────────────────────────────────────────────
-	let releaseTypePts = 0;
-	let releaseTypeLabel = "Unknown";
-	let discarded = false;
-	let discardReason = "";
+	const releaseType = detectFirst(RELEASE_TYPE, combined, "Unknown");
+	const discarded = releaseType.score <= -99999;
+	const discardReason = discarded ? releaseType.label : "";
 
-	for (const { re, score, label } of RELEASE_TYPE) {
-		if (re.test(combined)) {
-			releaseTypePts = score;
-			releaseTypeLabel = label;
-			if (score <= -99999) {
-				discarded = true;
-				discardReason = label;
-			}
-			break;
-		}
-	}
+	const hdr      = detectFirst(HDR_TYPES,     combined);
+	const audio    = detectFirst(AUDIO_TYPES,   combined);
+	const encoding = detectFirst(ENCODING_TYPES, combined);
 
-	// ── HDR ──────────────────────────────────────────────────────────────────
-	let hdrPts = 0;
-	let hdrLabel = "";
-
-	for (const { re, score, label } of HDR_TYPES) {
-		if (re.test(combined)) {
-			hdrPts = score;
-			hdrLabel = label;
-			break;
-		}
-	}
-
-	// ── Audio ─────────────────────────────────────────────────────────────────
-	let audioPts = 0;
-	let audioLabel = "";
-
-	for (const { re, score, label } of AUDIO_TYPES) {
-		if (re.test(combined)) {
-			audioPts = score;
-			audioLabel = label;
-			break;
-		}
-	}
-
-	// ── Encoding ─────────────────────────────────────────────────────────────
-	let encodingPts = 0;
-	let encodingLabel = "";
-
-	for (const { re, score, label } of ENCODING_TYPES) {
-		if (re.test(combined)) {
-			encodingPts = score;
-			encodingLabel = label;
-			break;
-		}
-	}
-
-	// ── Seeders ───────────────────────────────────────────────────────────────
-	const seeders = extractSeeders(title);
-	const seederPts = seederScore(seeders);
-
-	// ── File size scoring ────────────────────────────────────────────────────
-	// Rewards ideal size ranges and penalises suspiciously small or
-	// oversized files (e.g. remuxes that will buffer on most connections).
-	const isRemux = /\bremux\b/i.test(combined);
-	const sizeMB = extractSizeMB(title);
-	const sizeScore = calcSizeScore(quality, sizeMB, isRemux);
-
-	// ── Release-group bonus ───────────────────────────────────────────────────
+	const seeders    = extractSeeders(title);
+	const seederPts  = seederScore(seeders);
+	const isRemux    = /\bremux\b/i.test(combined);
+	const sizeMB     = extractSizeMB(title);
+	const sizeScore  = calcSizeScore(quality, sizeMB, isRemux);
 	const groupBonus = QUALITY_GROUPS.test(combined) ? 50 : 0;
+	const lang       = detectLanguage(combined);
 
-	// ── Language ──────────────────────────────────────────────────────────────
-	const lang = detectLanguage(combined);
-	const languagePts = lang.score;
-	const languageLabel = lang.label;
-
-	// ── Total ─────────────────────────────────────────────────────────────────
 	const total =
-		resolutionPts +
-		releaseTypePts +
-		hdrPts +
-		audioPts +
-		encodingPts +
-		seederPts +
-		sizeScore +
-		groupBonus +
-		languagePts;
+		resolutionPts + releaseType.score + hdr.score + audio.score +
+		encoding.score + seederPts + sizeScore + groupBonus + lang.score;
 
 	return {
 		total,
@@ -379,21 +337,21 @@ function scoreStream(stream) {
 		discardReason,
 		breakdown: {
 			resolution: resolutionPts,
-			releaseType: releaseTypePts,
-			hdr: hdrPts,
-			audio: audioPts,
-			encoding: encodingPts,
+			releaseType: releaseType.score,
+			hdr: hdr.score,
+			audio: audio.score,
+			encoding: encoding.score,
 			seeders: seederPts,
 			sizeScore,
 			groupBonus,
-			language: languagePts,
+			language: lang.score,
 		},
 		labels: {
-			releaseType: releaseTypeLabel,
-			hdr: hdrLabel,
-			audio: audioLabel,
-			encoding: encodingLabel,
-			language: languageLabel,
+			releaseType: releaseType.label,
+			hdr: hdr.label,
+			audio: audio.label,
+			encoding: encoding.label,
+			language: lang.label,
 		},
 		seeders,
 		sizeMB,
@@ -421,9 +379,9 @@ function buildStreamName(quality, scored) {
 	// Release type + optional audio tag
 	const audioPart = labels.audio ? ` ${labels.audio}` : "";
 	const sourcePart =
-		labels.releaseType !== "Unknown"
-			? `${labels.releaseType}${audioPart}`
-			: audioPart.trim();
+		labels.releaseType === "Unknown"
+			? audioPart.trim()
+			: `${labels.releaseType}${audioPart}`;
 
 	// Assemble — only include non-empty segments
 	const segments = [qualityTag, sourcePart].filter(Boolean);
@@ -432,37 +390,138 @@ function buildStreamName(quality, scored) {
 }
 
 // ---------------------------------------------------------------------------
+// Deduplication helpers
+// ---------------------------------------------------------------------------
+
+/**
+ * Extracts the 40-char hex infoHash from a stream object.
+ * Torrentio provides it either as stream.infoHash or inside the magnet URI.
+ * Returns null if not found.
+ */
+function extractInfoHash(stream) {
+	if (stream.infoHash) return stream.infoHash.toLowerCase();
+	const url = stream.url ?? "";
+	const match = url.match(/btih:([a-f0-9]{40})/i);
+	return match ? match[1].toLowerCase() : null;
+}
+
+/**
+ * Deduplicates streams by infoHash — keeps only the entry with the highest
+ * seeder count for each unique torrent. Streams without an extractable
+ * infoHash are always kept (we can't dedup them).
+ */
+function deduplicateStreams(rawStreams) {
+	const hashMap = new Map();
+	const noHash = [];
+
+	for (const stream of rawStreams) {
+		const hash = extractInfoHash(stream);
+		if (!hash) {
+			noHash.push(stream);
+			continue;
+		}
+
+		const title = stream.title ?? "";
+		const seeders = extractSeeders(title);
+		const existing = hashMap.get(hash);
+
+		if (!existing || seeders > existing.seeders) {
+			hashMap.set(hash, { stream, seeders });
+		}
+	}
+
+	const deduped = Array.from(hashMap.values(), (e) => e.stream);
+	return deduped.concat(noHash);
+}
+
+// ---------------------------------------------------------------------------
+// Tracker enrichment
+// ---------------------------------------------------------------------------
+
+/** Well-known public trackers — appended to magnet links for faster peer discovery. */
+const PUBLIC_TRACKERS = [
+	"udp://tracker.opentrackr.org:1337/announce",
+	"udp://open.stealth.si:80/announce",
+	"udp://tracker.torrent.eu.org:451/announce",
+	"udp://open.demonii.com:1337/announce",
+	"udp://explodie.org:6969/announce",
+	"udp://tracker.openbittorrent.com:6969/announce",
+];
+
+/**
+ * Appends missing public tracker announces to a magnet URI.
+ * Non-magnet URLs are returned unchanged.
+ */
+function enrichMagnet(url) {
+	if (!url?.startsWith("magnet:")) return url;
+
+	const existing = url.toLowerCase();
+	const toAdd = PUBLIC_TRACKERS.filter(
+		(tr) => !existing.includes(encodeURIComponent(tr).toLowerCase()) && !existing.includes(tr.toLowerCase()),
+	);
+
+	if (toAdd.length === 0) return url;
+	return url + toAdd.map((tr) => `&tr=${encodeURIComponent(tr)}`).join("");
+}
+
+// ---------------------------------------------------------------------------
 // Stream selection core
 // ---------------------------------------------------------------------------
 
 /**
  * Analyses a raw Torrentio streams array, scores every stream, discards
- * CAM/TS entries, buckets the rest into quality tiers, and returns the
- * winning stream per tier as enriched Stremio stream objects.
+ * CAM/TS entries and low-seeder streams, deduplicates by infoHash,
+ * buckets the rest into quality tiers, and returns the winning stream
+ * per tier as enriched Stremio stream objects.
  *
  * Returns { streams, debugInfo } where debugInfo is used by /debug endpoint.
  */
-function analyseStreams(rawStreams) {
-	/** @type {Map<string, {stream: object, scored: object}>} */
-	const buckets = new Map(QUALITY_TIERS.map((q) => [q, null]));
+/**
+ * Enriches a winning stream with tracker sources for faster peer discovery.
+ */
+function enrichWinnerStream(stream) {
+	if (stream.url) {
+		return { ...stream, url: enrichMagnet(stream.url) };
+	}
+	if (stream.infoHash && !stream.sources) {
+		return {
+			...stream,
+			sources: [
+				`dht:${stream.infoHash}`,
+				...PUBLIC_TRACKERS.map((tr) => `tracker:${tr}`),
+			],
+		};
+	}
+	return { ...stream };
+}
 
+/**
+ * Returns the discard reason string for a stream that failed filtering.
+ */
+function discardReason(scored) {
+	if (scored.discardReason) return scored.discardReason;
+	if (scored.seeders < MIN_SEEDERS) return `<${MIN_SEEDERS} seeders`;
+	return "score too low";
+}
+
+function analyseStreams(rawStreams) {
+	const dedupedStreams = deduplicateStreams(rawStreams);
+	const buckets = new Map(QUALITY_TIERS.map((q) => [q, null]));
 	const discardedLog = [];
 
-	for (const stream of rawStreams) {
+	for (const stream of dedupedStreams) {
 		const scored = scoreStream(stream);
 
-		const zeroSeeders = scored.seeders === 0;
-		if (scored.discarded || zeroSeeders) {
+		if (scored.discarded || scored.seeders < MIN_SEEDERS) {
 			discardedLog.push({
 				name: stream.name ?? "",
 				title: (stream.title ?? "").split("\n")[0],
-				reason: scored.discardReason || (zeroSeeders ? "0 seeders" : "score too low"),
+				reason: discardReason(scored),
 				score: scored.total,
 			});
 			continue;
 		}
 
-		// Only bucket recognised quality tiers (skip unknown)
 		if (!QUALITY_TIERS.includes(scored.quality)) continue;
 
 		const current = buckets.get(scored.quality);
@@ -471,7 +530,6 @@ function analyseStreams(rawStreams) {
 		}
 	}
 
-	// Build Stremio stream objects for winners
 	const streams = [];
 	const winners = {};
 
@@ -480,7 +538,8 @@ function analyseStreams(rawStreams) {
 		if (!entry) continue;
 
 		const name = buildStreamName(quality, entry.scored);
-		streams.push({ ...entry.stream, name });
+		const enriched = enrichWinnerStream({ ...entry.stream, name });
+		streams.push(enriched);
 
 		winners[`winner_${quality}`] = {
 			name,
@@ -544,7 +603,6 @@ async function fetchTorrentioStreams(type, id, torrentioBase = TORRENTIO_DEFAULT
 			return Array.isArray(data.streams) ? data.streams : [];
 		} catch (err) {
 			console.error(`Failed to fetch from Torrentio (${base}): ${err.message}`);
-			continue;
 		}
 	}
 
@@ -575,6 +633,38 @@ function notFound() {
 	return new Response("Not Found", { status: 404, headers: CORS_HEADERS });
 }
 
+/**
+ * Builds a cacheable JSON response with SWR metadata headers.
+ * - X-Cached-At: unix timestamp when this entry was created
+ * - X-Soft-TTL: the "fresh" window in seconds; after this, background revalidation fires
+ * - Cache-Control max-age: set to 4× soft TTL so CF cache keeps the entry around
+ *   long enough for stale serving + revalidation
+ */
+function buildCachedResponse(streams) {
+	// Adaptive soft TTL:
+	// - 0 streams: 2 min (Torrentio failed)
+	// - < 2 streams: 10 min (new release)
+	// - normal: 8h
+	let softTtl;
+	if (streams.length === 0) {
+		softTtl = 120;
+	} else if (streams.length < 2) {
+		softTtl = 600;
+	} else {
+		softTtl = 28800;
+	}
+
+	const headers = {
+		...CORS_HEADERS,
+		"Content-Type": "application/json; charset=utf-8",
+		"Cache-Control": `public, max-age=${softTtl * 4}`,
+		"X-Cached-At": String(Math.floor(Date.now() / 1000)),
+		"X-Soft-TTL": String(softTtl),
+	};
+
+	return new Response(JSON.stringify({ streams }), { status: 200, headers });
+}
+
 // ---------------------------------------------------------------------------
 // Router
 // ---------------------------------------------------------------------------
@@ -589,6 +679,51 @@ function notFound() {
  *   OPTIONS *  (CORS pre-flight)
  *   GET  /  (redirect → /manifest.json)
  */
+async function handleStreamRoute(request, ctx, type, id, torrentioBase) {
+	if (!/^tt\d+(:\d+:\d+)?$/.test(id)) {
+		return jsonResponse({ streams: [] }, 200, 60);
+	}
+
+	const cache = caches.default;
+	const cacheKey = new Request(
+		`${new URL(request.url).origin}/stream/${type}/${id}.json`,
+	);
+	const cached = await cache.match(cacheKey);
+
+	if (cached) {
+		const cachedAt = Number.parseInt(cached.headers.get("X-Cached-At") ?? "0", 10);
+		const softTtl = Number.parseInt(cached.headers.get("X-Soft-TTL") ?? "28800", 10);
+		const age = Math.floor(Date.now() / 1000) - cachedAt;
+
+		if (age > softTtl && ctx) {
+			ctx.waitUntil((async () => {
+				const rawStreams = await fetchTorrentioStreams(type, id, torrentioBase);
+				const fresh = buildCachedResponse(selectBestStreams(rawStreams));
+				await cache.put(cacheKey, fresh);
+			})());
+		}
+
+		return new Response(cached.body, {
+			status: cached.status,
+			headers: { ...Object.fromEntries(cached.headers), ...CORS_HEADERS },
+		});
+	}
+
+	const rawStreams = await fetchTorrentioStreams(type, id, torrentioBase);
+	const response = buildCachedResponse(selectBestStreams(rawStreams));
+	if (ctx) ctx.waitUntil(cache.put(cacheKey, response.clone()));
+	return response;
+}
+
+async function handleDebugRoute(searchParams, type, id, torrentioBase, debugKey) {
+	if (debugKey && searchParams.get("key") !== debugKey) {
+		return new Response("Forbidden", { status: 403, headers: CORS_HEADERS });
+	}
+	const rawStreams = await fetchTorrentioStreams(type, id, torrentioBase);
+	const { debugInfo } = analyseStreams(rawStreams);
+	return jsonResponse(debugInfo, 200, 0, true);
+}
+
 async function handleRequest(request, ctx, env = {}) {
 	const { pathname, searchParams } = new URL(request.url);
 	const torrentioBase = env.TORRENTIO_URL ?? TORRENTIO_DEFAULT;
@@ -596,79 +731,26 @@ async function handleRequest(request, ctx, env = {}) {
 	if (request.method === "OPTIONS") {
 		return new Response(null, { status: 204, headers: CORS_HEADERS });
 	}
-
 	if (request.method !== "GET") {
-		return new Response("Method Not Allowed", {
-			status: 405,
-			headers: CORS_HEADERS,
-		});
+		return new Response("Method Not Allowed", { status: 405, headers: CORS_HEADERS });
 	}
 
-	// ── /manifest.json ──────────────────────────────────────────────────────
 	if (pathname === "/manifest.json") {
 		return jsonResponse(MANIFEST, 200, 86400);
 	}
 
-	// ── /stream/:type/:id.json ───────────────────────────────────────────────
-	const streamMatch = pathname.match(
-		/^\/stream\/(movie|series)\/([^/]+)\.json$/,
-	);
+	const streamMatch = /^\/stream\/(movie|series)\/([^/]+)\.json$/.exec(pathname);
 	if (streamMatch) {
 		const [, type, id] = streamMatch;
-
-		// Validate IMDB id format first — rejects junk without touching the cache
-		if (!/^tt\d+(:\d+:\d+)?$/.test(id)) {
-			return jsonResponse({ streams: [] }, 200, 60);
-		}
-
-		// Normalise cache key to path-only so ?query variants share one entry
-		const cache = caches.default;
-		const cacheKey = new Request(
-			`${new URL(request.url).origin}/stream/${type}/${id}.json`,
-		);
-		const cached = await cache.match(cacheKey);
-		if (cached) return cached;
-
-		const rawStreams = await fetchTorrentioStreams(type, id, torrentioBase);
-		const streams = selectBestStreams(rawStreams);
-
-		// Adaptive TTL:
-		// - 0 streams (Torrentio failed/429): cache 2 min to stop hammering
-		// - < 2 streams (new release, only 1 result): cache 10 min
-		// - normal: full TTL (movies 8h, series 8h)
-		let ttl;
-		if (streams.length === 0) {
-			ttl = 120;
-		} else if (streams.length < 2) {
-			ttl = 600;
-		} else {
-			ttl = 28800;
-		}
-
-		const response = jsonResponse({ streams }, 200, ttl);
-
-		// Store in edge cache asynchronously — does not block the response
-		if (ctx) ctx.waitUntil(cache.put(cacheKey, response.clone()));
-
-		return response;
+		return handleStreamRoute(request, ctx, type, id, torrentioBase);
 	}
 
-	// ── /debug/:type/:id ─────────────────────────────────────────────────────
-	// Returns the full per-stream scoring breakdown for developer inspection.
-	// Example: GET /debug/movie/tt0371746
-	const debugMatch = pathname.match(/^\/debug\/(movie|series)\/([^/]+)$/);
+	const debugMatch = /^\/debug\/(movie|series)\/([^/]+)$/.exec(pathname);
 	if (debugMatch) {
-		const debugKey = env.DEBUG_KEY;
-		if (debugKey && searchParams.get("key") !== debugKey) {
-			return new Response("Forbidden", { status: 403, headers: CORS_HEADERS });
-		}
 		const [, type, id] = debugMatch;
-		const rawStreams = await fetchTorrentioStreams(type, id, torrentioBase);
-		const { debugInfo } = analyseStreams(rawStreams);
-		return jsonResponse(debugInfo, 200, 0, true);
+		return handleDebugRoute(searchParams, type, id, torrentioBase, env.DEBUG_KEY);
 	}
 
-	// ── / (root redirect) ────────────────────────────────────────────────────
 	if (pathname === "/" || pathname === "") {
 		return new Response(null, {
 			status: 302,
@@ -695,8 +777,11 @@ export default {
 
 export {
 	calcSizeScore,
+	deduplicateStreams,
 	detectLanguage,
 	detectQuality,
+	enrichMagnet,
+	extractInfoHash,
 	extractSeeders,
 	extractSizeMB,
 	seederScore,

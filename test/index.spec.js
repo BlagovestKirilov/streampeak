@@ -6,8 +6,11 @@ import {
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import worker, {
 	calcSizeScore,
+	deduplicateStreams,
 	detectLanguage,
 	detectQuality,
+	enrichMagnet,
+	extractInfoHash,
 	extractSeeders,
 	extractSizeMB,
 	seederScore,
@@ -646,7 +649,7 @@ describe("analyseStreams", () => {
 		expect(streams[0].name).toMatch(/1080p/);
 	});
 
-	it("preserves original stream fields (url, behaviorHints)", () => {
+	it("preserves original stream fields (url, behaviorHints) and enriches magnet", () => {
 		const raw = [
 			{
 				name: "Torrentio",
@@ -657,7 +660,8 @@ describe("analyseStreams", () => {
 		];
 
 		const { streams } = analyseStreams(raw);
-		expect(streams[0].url).toBe("magnet:?xt=urn:btih:abc");
+		expect(streams[0].url).toContain("magnet:?xt=urn:btih:abc");
+		expect(streams[0].url).toContain("&tr=");
 		expect(streams[0].behaviorHints).toEqual({ notWebReady: true });
 	});
 
@@ -672,12 +676,12 @@ describe("analyseStreams", () => {
 		expect(debugInfo.winner_4k.breakdown).toBeDefined();
 	});
 
-	it("discards 0-seeder streams and logs reason as '0 seeders'", () => {
-		const raw = [make("Torrentio", "1080p BluRay\n👤 0 💾 8 GB ⚙ Source")];
+	it("discards low-seeder streams (<5) and logs reason", () => {
+		const raw = [make("Torrentio", "1080p BluRay\n👤 3 💾 8 GB ⚙ Source")];
 		const { streams, debugInfo } = analyseStreams(raw);
 		expect(streams).toHaveLength(0);
 		expect(debugInfo.discarded).toHaveLength(1);
-		expect(debugInfo.discarded[0].reason).toBe("0 seeders");
+		expect(debugInfo.discarded[0].reason).toBe("<5 seeders");
 	});
 
 	it("0-seeder stream loses to same stream with seeders", () => {
@@ -697,7 +701,7 @@ describe("analyseStreams", () => {
 		];
 		const { streams } = analyseStreams(raw);
 		expect(streams).toHaveLength(1);
-		expect(streams[0].name).not.toMatch(/\[non-EN\]/);
+		expect(streams[0].name).not.toMatch(/\[non-EN]/);
 	});
 
 	it("non-English winner shows same name format as English (no language tag)", () => {
@@ -719,6 +723,372 @@ describe("selectBestStreams", () => {
 		const result = selectBestStreams(raw);
 		expect(Array.isArray(result)).toBe(true);
 		expect(result[0].name).toMatch(/1080p/);
+	});
+});
+
+// ---------------------------------------------------------------------------
+// extractInfoHash
+// ---------------------------------------------------------------------------
+
+describe("extractInfoHash", () => {
+	it("extracts infoHash from stream.infoHash field", () => {
+		const stream = { infoHash: "AABB00112233445566778899AABBCCDDEEFF0011" };
+		expect(extractInfoHash(stream)).toBe("aabb00112233445566778899aabbccddeeff0011");
+	});
+
+	it("extracts infoHash from magnet URI in stream.url", () => {
+		const stream = {
+			url: "magnet:?xt=urn:btih:1234567890abcdef1234567890abcdef12345678&dn=Movie",
+		};
+		expect(extractInfoHash(stream)).toBe("1234567890abcdef1234567890abcdef12345678");
+	});
+
+	it("returns null when no infoHash found", () => {
+		const stream = { name: "T", title: "1080p", url: "http://example.com/file.mkv" };
+		expect(extractInfoHash(stream)).toBeNull();
+	});
+
+	it("returns null when stream has no url or infoHash", () => {
+		const stream = { name: "T", title: "1080p" };
+		expect(extractInfoHash(stream)).toBeNull();
+	});
+});
+
+// ---------------------------------------------------------------------------
+// deduplicateStreams
+// ---------------------------------------------------------------------------
+
+describe("deduplicateStreams", () => {
+	const hash1 = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+	const hash2 = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+	it("keeps highest-seeder entry for duplicate infoHash", () => {
+		const streams = [
+			{ infoHash: hash1, title: "1080p BluRay\n👤 50 💾 8 GB", name: "T" },
+			{ infoHash: hash1, title: "1080p BluRay\n👤 200 💾 8 GB", name: "T" },
+			{ infoHash: hash1, title: "1080p BluRay\n👤 100 💾 8 GB", name: "T" },
+		];
+		const result = deduplicateStreams(streams);
+		expect(result).toHaveLength(1);
+		expect(result[0].title).toContain("👤 200");
+	});
+
+	it("keeps all entries with different infoHashes", () => {
+		const streams = [
+			{ infoHash: hash1, title: "1080p\n👤 50 💾 5 GB", name: "T" },
+			{ infoHash: hash2, title: "4K\n👤 30 💾 20 GB", name: "T" },
+		];
+		const result = deduplicateStreams(streams);
+		expect(result).toHaveLength(2);
+	});
+
+	it("preserves streams without infoHash (cannot dedup)", () => {
+		const streams = [
+			{ name: "T", title: "1080p\n👤 50 💾 5 GB", url: "http://example.com/a.mkv" },
+			{ name: "T", title: "1080p\n👤 80 💾 5 GB", url: "http://example.com/b.mkv" },
+		];
+		const result = deduplicateStreams(streams);
+		expect(result).toHaveLength(2);
+	});
+
+	it("extracts hash from magnet URI for dedup", () => {
+		const magnetA = `magnet:?xt=urn:btih:${hash1}&dn=Movie+A`;
+		const magnetB = `magnet:?xt=urn:btih:${hash1}&dn=Movie+B`;
+		const streams = [
+			{ name: "T", title: "1080p\n👤 10 💾 5 GB", url: magnetA },
+			{ name: "T", title: "1080p\n👤 99 💾 5 GB", url: magnetB },
+		];
+		const result = deduplicateStreams(streams);
+		expect(result).toHaveLength(1);
+		expect(result[0].title).toContain("👤 99");
+	});
+
+	it("mixed: deduplicates hashed entries and keeps non-hashed", () => {
+		const streams = [
+			{ infoHash: hash1, title: "1080p\n👤 10 💾 5 GB", name: "T" },
+			{ infoHash: hash1, title: "1080p\n👤 50 💾 5 GB", name: "T" },
+			{ name: "T", title: "720p\n👤 30 💾 2 GB", url: "http://example.com" },
+		];
+		const result = deduplicateStreams(streams);
+		expect(result).toHaveLength(2);
+	});
+});
+
+// ---------------------------------------------------------------------------
+// analyseStreams — min seeders threshold
+// ---------------------------------------------------------------------------
+
+describe("analyseStreams — min seeders threshold", () => {
+	const make = (name, title, url = "magnet:?test") => ({ name, title, url });
+
+	it("discards streams with 4 seeders (below threshold of 5)", () => {
+		const raw = [make("T", "1080p WEB-DL\n👤 4 💾 6 GB ⚙ Source")];
+		const { streams, debugInfo } = analyseStreams(raw);
+		expect(streams).toHaveLength(0);
+		expect(debugInfo.discarded[0].reason).toBe("<5 seeders");
+	});
+
+	it("accepts streams with exactly 5 seeders", () => {
+		const raw = [make("T", "1080p WEB-DL\n👤 5 💾 6 GB ⚙ Source")];
+		const { streams } = analyseStreams(raw);
+		expect(streams).toHaveLength(1);
+	});
+
+	it("discards streams with 1 seeder", () => {
+		const raw = [make("T", "720p WEBRip\n👤 1 💾 2 GB ⚙ Source")];
+		const { streams, debugInfo } = analyseStreams(raw);
+		expect(streams).toHaveLength(0);
+		expect(debugInfo.discarded[0].reason).toBe("<5 seeders");
+	});
+
+	it("keeps streams with 100 seeders", () => {
+		const raw = [make("T", "4K BluRay HDR\n👤 100 💾 25 GB ⚙ Source")];
+		const { streams } = analyseStreams(raw);
+		expect(streams).toHaveLength(1);
+	});
+});
+
+// ---------------------------------------------------------------------------
+// analyseStreams — deduplication integration
+// ---------------------------------------------------------------------------
+
+describe("analyseStreams — deduplication integration", () => {
+	const hash = "cccccccccccccccccccccccccccccccccccccccc";
+
+	it("deduplicates before scoring — only best copy enters the bucket", () => {
+		const raw = [
+			{ infoHash: hash, name: "T", title: "1080p BluRay\n👤 50 💾 8 GB ⚙ Source" },
+			{ infoHash: hash, name: "T", title: "1080p BluRay\n👤 200 💾 8 GB ⚙ Source" },
+		];
+		const { debugInfo } = analyseStreams(raw);
+		// Only 1 stream should be analyzed (the deduped winner with 200 seeders)
+		expect(debugInfo.total_streams_analyzed).toBe(2);
+		expect(debugInfo.winner_1080p).toBeDefined();
+		expect(debugInfo.winner_1080p.seeders).toBe(200);
+	});
+
+	it("different hashes in same quality — highest score wins bucket", () => {
+		const hashA = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+		const hashB = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+		const raw = [
+			{ infoHash: hashA, name: "T", title: "1080p WEB-DL\n👤 50 💾 5 GB ⚙ Source" },
+			{ infoHash: hashB, name: "T", title: "1080p BluRay Atmos\n👤 300 💾 10 GB ⚙ Source" },
+		];
+		const { debugInfo } = analyseStreams(raw);
+		expect(debugInfo.winner_1080p.seeders).toBe(300);
+	});
+});
+
+// ---------------------------------------------------------------------------
+// handleRequest — stale-while-revalidate
+// ---------------------------------------------------------------------------
+
+describe("handleRequest — stale-while-revalidate", () => {
+	afterEach(() => vi.unstubAllGlobals());
+
+	it("returns cached response and triggers background revalidation when stale", async () => {
+		const staleTimestamp = String(Math.floor(Date.now() / 1000) - 30000); // 30000s ago
+		const cachedBody = JSON.stringify({ streams: [{ name: "⚡ 1080p | WEB-DL", url: "magnet:?old" }] });
+		const cachedResponse = new Response(cachedBody, {
+			status: 200,
+			headers: {
+				"Content-Type": "application/json; charset=utf-8",
+				"X-Cached-At": staleTimestamp,
+				"X-Soft-TTL": "28800",
+				"Cache-Control": "public, max-age=115200",
+			},
+		});
+
+		const putFn = vi.fn();
+		const cacheMock = { match: vi.fn().mockResolvedValue(cachedResponse), put: putFn };
+		vi.stubGlobal("caches", { default: cacheMock });
+
+		const fetchSpy = vi.fn().mockResolvedValue(
+			new Response(JSON.stringify({ streams: [{ name: "T", title: "1080p WEB-DL\n👤 100 💾 6 GB", url: "magnet:?new" }] }), {
+				status: 200,
+				headers: { "content-type": "application/json" },
+			}),
+		);
+		vi.stubGlobal("fetch", fetchSpy);
+
+		const waitUntilFns = [];
+		const ctx = { waitUntil: (p) => waitUntilFns.push(p) };
+
+		const req = new Request("http://worker.test/stream/movie/tt1234567.json");
+		const res = await handleRequest(req, ctx);
+
+		// Should return the stale cached response immediately
+		expect(res.status).toBe(200);
+		const body = await res.json();
+		expect(body.streams[0].url).toBe("magnet:?old");
+
+		// Background revalidation should have been triggered
+		expect(waitUntilFns.length).toBe(1);
+		await waitUntilFns[0]; // await the revalidation promise
+		expect(fetchSpy).toHaveBeenCalled();
+		expect(putFn).toHaveBeenCalled();
+	});
+
+	it("returns cached response WITHOUT revalidation when still fresh", async () => {
+		const freshTimestamp = String(Math.floor(Date.now() / 1000) - 100); // 100s ago (fresh)
+		const cachedBody = JSON.stringify({ streams: [{ name: "⚡ 4K | BluRay", url: "magnet:?fresh" }] });
+		const cachedResponse = new Response(cachedBody, {
+			status: 200,
+			headers: {
+				"Content-Type": "application/json; charset=utf-8",
+				"X-Cached-At": freshTimestamp,
+				"X-Soft-TTL": "28800",
+				"Cache-Control": "public, max-age=115200",
+			},
+		});
+
+		const cacheMock = { match: vi.fn().mockResolvedValue(cachedResponse), put: vi.fn() };
+		vi.stubGlobal("caches", { default: cacheMock });
+
+		const fetchSpy = vi.fn();
+		vi.stubGlobal("fetch", fetchSpy);
+
+		const waitUntilFns = [];
+		const ctx = { waitUntil: (p) => waitUntilFns.push(p) };
+
+		const req = new Request("http://worker.test/stream/movie/tt1234567.json");
+		const res = await handleRequest(req, ctx);
+
+		expect(res.status).toBe(200);
+		const body = await res.json();
+		expect(body.streams[0].url).toBe("magnet:?fresh");
+
+		// Should NOT trigger background revalidation
+		expect(waitUntilFns.length).toBe(0);
+		expect(fetchSpy).not.toHaveBeenCalled();
+	});
+});
+
+// ---------------------------------------------------------------------------
+// enrichMagnet
+// ---------------------------------------------------------------------------
+
+describe("enrichMagnet", () => {
+	it("appends public trackers to a bare magnet link", () => {
+		const magnet = "magnet:?xt=urn:btih:abc123&dn=Movie";
+		const result = enrichMagnet(magnet);
+		expect(result).toContain("&tr=");
+		expect(result).toContain("tracker.opentrackr.org");
+		expect(result).toContain("open.stealth.si");
+		expect(result).toContain("tracker.torrent.eu.org");
+	});
+
+	it("does not duplicate trackers already present in the magnet", () => {
+		const magnet = "magnet:?xt=urn:btih:abc123&tr=udp%3A%2F%2Ftracker.opentrackr.org%3A1337%2Fannounce";
+		const result = enrichMagnet(magnet);
+		// opentrackr should appear only once
+		const count = (result.match(/opentrackr/g) || []).length;
+		expect(count).toBe(1);
+		// but others should be added
+		expect(result).toContain("open.stealth.si");
+	});
+
+	it("returns non-magnet URLs unchanged", () => {
+		const url = "http://example.com/file.mkv";
+		expect(enrichMagnet(url)).toBe(url);
+	});
+
+	it("returns undefined/null/empty unchanged", () => {
+		expect(enrichMagnet(undefined)).toBeUndefined();
+		expect(enrichMagnet(null)).toBeNull();
+		expect(enrichMagnet("")).toBe("");
+	});
+
+	it("handles magnet with existing trackers (unencoded) without duplicating", () => {
+		const magnet = "magnet:?xt=urn:btih:abc123&tr=udp://open.stealth.si:80/announce";
+		const result = enrichMagnet(magnet);
+		const count = (result.match(/open\.stealth\.si/g) || []).length;
+		expect(count).toBe(1);
+	});
+});
+
+describe("analyseStreams — tracker enrichment integration", () => {
+	it("enriches winning stream magnet URLs with public trackers", () => {
+		const raw = [
+			{
+				name: "T",
+				title: "1080p BluRay x265\n👤 200 💾 8 GB ⚙ Source",
+				url: "magnet:?xt=urn:btih:aabbccdd11223344556677889900aabbccddeeff&dn=Movie",
+			},
+		];
+		const { streams } = analyseStreams(raw);
+		expect(streams).toHaveLength(1);
+		expect(streams[0].url).toContain("&tr=");
+		expect(streams[0].url).toContain("tracker.opentrackr.org");
+	});
+
+	it("does not modify non-magnet stream URLs", () => {
+		const raw = [
+			{
+				name: "T",
+				title: "1080p WEB-DL\n👤 100 💾 5 GB ⚙ Source",
+				url: "http://example.com/stream.mkv",
+			},
+		];
+		const { streams } = analyseStreams(raw);
+		expect(streams).toHaveLength(1);
+		expect(streams[0].url).toBe("http://example.com/stream.mkv");
+	});
+
+	it("adds sources array to infoHash-only streams (no url, no sources)", () => {
+		const raw = [
+			{
+				name: "T",
+				title: "4K BluRay HDR\n👤 200 💾 25 GB ⚙ Source",
+				infoHash: "0e78b0777e8ad05581de003530f98f9ecb33be2e",
+				fileIdx: 0,
+			},
+		];
+		const { streams } = analyseStreams(raw);
+		expect(streams).toHaveLength(1);
+		expect(streams[0].sources).toBeDefined();
+		expect(streams[0].sources[0]).toBe("dht:0e78b0777e8ad05581de003530f98f9ecb33be2e");
+		expect(streams[0].sources.some((s) => s.includes("tracker.opentrackr.org"))).toBe(true);
+		expect(streams[0].sources.some((s) => s.includes("open.stealth.si"))).toBe(true);
+		// Original fields preserved
+		expect(streams[0].infoHash).toBe("0e78b0777e8ad05581de003530f98f9ecb33be2e");
+		expect(streams[0].fileIdx).toBe(0);
+	});
+
+	it("does NOT overwrite existing sources array", () => {
+		const existingSources = [
+			"tracker:udp://existing-tracker.org:6969/announce",
+			"dht:92406642886c2e706b7af436f742e5e3cd2ab595",
+		];
+		const raw = [
+			{
+				name: "T",
+				title: "720p BDRip\n👤 50 💾 5 GB ⚙ Source",
+				infoHash: "92406642886c2e706b7af436f742e5e3cd2ab595",
+				sources: existingSources,
+				fileIdx: 0,
+			},
+		];
+		const { streams } = analyseStreams(raw);
+		expect(streams).toHaveLength(1);
+		expect(streams[0].sources).toEqual(existingSources);
+	});
+
+	it("does NOT add sources when stream has url (even with infoHash)", () => {
+		const raw = [
+			{
+				name: "T",
+				title: "1080p WEB-DL\n👤 80 💾 6 GB ⚙ Source",
+				url: "magnet:?xt=urn:btih:aabbccdd11223344556677889900aabbccddeeff&dn=Test",
+				infoHash: "aabbccdd11223344556677889900aabbccddeeff",
+			},
+		];
+		const { streams } = analyseStreams(raw);
+		expect(streams).toHaveLength(1);
+		// url should be enriched (magnet trackers appended)
+		expect(streams[0].url).toContain("&tr=");
+		// sources should NOT be added (url branch handles enrichment)
+		expect(streams[0].sources).toBeUndefined();
 	});
 });
 
@@ -856,23 +1226,28 @@ describe("handleRequest — caching", () => {
 
 	afterEach(() => vi.unstubAllGlobals());
 
-	it("movie stream response has Cache-Control max-age=28800", async () => {
+	it("movie stream response has Cache-Control max-age=115200 (softTtl 28800 × 4)", async () => {
 		const req = new Request("http://worker.test/stream/movie/tt0468569.json");
 		const res = await handleRequest(req);
-		expect(res.headers.get("Cache-Control")).toBe("public, max-age=28800");
+		expect(res.headers.get("Cache-Control")).toBe("public, max-age=115200");
 	});
 
-	it("series stream response has Cache-Control max-age=28800", async () => {
+	it("series stream response has Cache-Control max-age=115200", async () => {
 		const req = new Request("http://worker.test/stream/series/tt0903747:1:1.json");
 		const res = await handleRequest(req);
-		expect(res.headers.get("Cache-Control")).toBe("public, max-age=28800");
+		expect(res.headers.get("Cache-Control")).toBe("public, max-age=115200");
 	});
 
 	it("returns cached response when cache hits and does not call Torrentio", async () => {
+		const freshTimestamp = String(Math.floor(Date.now() / 1000) - 100);
 		const cachedBody = JSON.stringify({ streams: [{ name: "cached", title: "cached", url: "m" }] });
 		const cachedResponse = new Response(cachedBody, {
 			status: 200,
-			headers: { "Content-Type": "application/json" },
+			headers: {
+				"Content-Type": "application/json",
+				"X-Cached-At": freshTimestamp,
+				"X-Soft-TTL": "28800",
+			},
 		});
 		const hitCacheMock = {
 			match: vi.fn().mockResolvedValue(cachedResponse),
@@ -901,7 +1276,7 @@ describe("handleRequest — caching", () => {
 		expect(noCacheMock.put).toHaveBeenCalledOnce();
 	});
 
-	it("uses 2-minute TTL when Torrentio returns empty (failure/429)", async () => {
+	it("uses 2-min soft TTL (max-age=480) when Torrentio returns empty (failure/429)", async () => {
 		vi.stubGlobal(
 			"fetch",
 			vi.fn().mockResolvedValue(
@@ -913,10 +1288,11 @@ describe("handleRequest — caching", () => {
 		);
 		const req = new Request("http://worker.test/stream/movie/tt0468569.json");
 		const res = await handleRequest(req);
-		expect(res.headers.get("Cache-Control")).toBe("public, max-age=120");
+		expect(res.headers.get("Cache-Control")).toBe("public, max-age=480");
+		expect(res.headers.get("X-Soft-TTL")).toBe("120");
 	});
 
-	it("uses 10-minute TTL when fewer than 2 streams (new release)", async () => {
+	it("uses 10-min soft TTL (max-age=2400) when fewer than 2 streams (new release)", async () => {
 		const sparse = [
 			{ name: "T", title: "1080p WEB-DL\n👤 50 💾 6 GB ⚙ S", url: "magnet:?a" },
 		];
@@ -931,7 +1307,8 @@ describe("handleRequest — caching", () => {
 		);
 		const req = new Request("http://worker.test/stream/movie/tt0468569.json");
 		const res = await handleRequest(req);
-		expect(res.headers.get("Cache-Control")).toBe("public, max-age=600");
+		expect(res.headers.get("Cache-Control")).toBe("public, max-age=2400");
+		expect(res.headers.get("X-Soft-TTL")).toBe("600");
 	});
 });
 
