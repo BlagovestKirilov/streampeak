@@ -502,75 +502,20 @@ describe("scoreStream", () => {
 // ---------------------------------------------------------------------------
 
 describe("buildStreamName", () => {
-	it("builds full label for a 4K HDR BluRay Atmos stream", () => {
-		const scored = {
-			labels: { releaseType: "BluRay", hdr: "HDR10+", audio: "Atmos", encoding: "x265" },
-			seeders: 342,
-			sizeMB: 45 * 1024,
-		};
-		const name = buildStreamName("4k", scored);
-		expect(name).toBe("⚡ 4K HDR10+ | BluRay Atmos");
+	it("returns ⚡ 4K for 4k quality", () => {
+		expect(buildStreamName("4k")).toBe("⚡ 4K");
 	});
 
-	it("builds label for a 1080p WEB-DL DD+ stream", () => {
-		const scored = {
-			labels: { releaseType: "WEB-DL", hdr: "", audio: "DD+", encoding: "x264" },
-			seeders: 891,
-			sizeMB: 8.7 * 1024,
-		};
-		const name = buildStreamName("1080p", scored);
-		expect(name).toBe("⚡ 1080p | WEB-DL DD+");
+	it("returns ⚡ 1080p for 1080p quality", () => {
+		expect(buildStreamName("1080p")).toBe("⚡ 1080p");
 	});
 
-	it("omits HDR when not detected", () => {
-		const scored = {
-			labels: { releaseType: "WEBRip", hdr: "", audio: "AAC", encoding: "" },
-			seeders: 234,
-			sizeMB: 2.1 * 1024,
-		};
-		const name = buildStreamName("720p", scored);
-		expect(name).toMatch(/^⚡ 720p \|/);
-		expect(name).not.toMatch(/HDR/);
+	it("returns ⚡ 720p for 720p quality", () => {
+		expect(buildStreamName("720p")).toBe("⚡ 720p");
 	});
 
-	it("omits audio when not detected", () => {
-		const scored = {
-			labels: { releaseType: "WEB-DL", hdr: "", audio: "", encoding: "" },
-			seeders: 100,
-			sizeMB: 5 * 1024,
-		};
-		const name = buildStreamName("1080p", scored);
-		expect(name).toBe("⚡ 1080p | WEB-DL");
-	});
-
-	it("omits size segment when sizeMB is 0", () => {
-		const scored = {
-			labels: { releaseType: "BluRay", hdr: "HDR", audio: "DTS", encoding: "" },
-			seeders: 500,
-			sizeMB: 0,
-		};
-		const name = buildStreamName("4k", scored);
-		expect(name).toBe("⚡ 4K HDR | BluRay DTS");
-	});
-
-	it("shows quality and release type when size is sub-GB", () => {
-		const scored = {
-			labels: { releaseType: "WEBRip", hdr: "", audio: "", encoding: "" },
-			seeders: 50,
-			sizeMB: 850,
-		};
-		const name = buildStreamName("720p", scored);
-		expect(name).toBe("⚡ 720p | WEBRip");
-	});
-
-	it("language label does not appear in stream name (scoring only)", () => {
-		const scored = {
-			labels: { releaseType: "WEB-DL", hdr: "", audio: "DD+", encoding: "", language: "non-EN" },
-			seeders: 100,
-			sizeMB: 6 * 1024,
-		};
-		const name = buildStreamName("1080p", scored);
-		expect(name).toBe("⚡ 1080p | WEB-DL DD+");
+	it("returns ⚡ 480p for 480p quality", () => {
+		expect(buildStreamName("480p")).toBe("⚡ 480p");
 	});
 });
 
@@ -622,9 +567,10 @@ describe("analyseStreams", () => {
 			make("Torrentio", "1080p BluRay\n👤 100 💾 8 GB ⚙ Source"),
 		];
 
-		const { streams } = analyseStreams(raw);
+		const { streams, debugInfo } = analyseStreams(raw);
 		expect(streams).toHaveLength(1);
-		expect(streams[0].name).toMatch(/BluRay/);
+		expect(streams[0].name).toBe("⚡ 1080p");
+		expect(debugInfo.winner_1080p.labels.releaseType).toBe("BluRay");
 	});
 
 	it("returns empty streams when all are CAM/TS", () => {
@@ -684,14 +630,15 @@ describe("analyseStreams", () => {
 		expect(debugInfo.discarded[0].reason).toBe("<5 seeders");
 	});
 
-	it("0-seeder stream loses to same stream with seeders", () => {
+	it("0-seeder stream (no seeder count) is discarded", () => {
 		const raw = [
 			make("Torrentio", "1080p BluRay\n👤 0 💾 8 GB ⚙ Source"),
 			make("Torrentio", "1080p WEB-DL\n👤 5 💾 6 GB ⚙ Source"),
 		];
-		const { streams } = analyseStreams(raw);
+		const { streams, debugInfo } = analyseStreams(raw);
 		expect(streams).toHaveLength(1);
-		expect(streams[0].name).toMatch(/WEB-DL/);
+		expect(streams[0].name).toBe("⚡ 1080p");
+		expect(debugInfo.winner_1080p.labels.releaseType).toBe("WEB-DL");
 	});
 
 	it("English stream beats non-English stream of same quality and seeders", () => {

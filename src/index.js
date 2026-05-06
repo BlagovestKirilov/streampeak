@@ -368,25 +368,9 @@ function scoreStream(stream) {
  * Format: "⚡ 4K HDR10+ | BluRay Atmos"
  * Omits sections for which no data was detected.
  */
-function buildStreamName(quality, scored) {
-	const { labels } = scored;
-
-	// Quality + optional HDR tag
+function buildStreamName(quality) {
 	const qualityStr = quality === "4k" ? "4K" : quality;
-	const hdrPart = labels.hdr ? ` ${labels.hdr}` : "";
-	const qualityTag = `⚡ ${qualityStr}${hdrPart}`;
-
-	// Release type + optional audio tag
-	const audioPart = labels.audio ? ` ${labels.audio}` : "";
-	const sourcePart =
-		labels.releaseType === "Unknown"
-			? audioPart.trim()
-			: `${labels.releaseType}${audioPart}`;
-
-	// Assemble — only include non-empty segments
-	const segments = [qualityTag, sourcePart].filter(Boolean);
-
-	return segments.join(" | ");
+	return `⚡ ${qualityStr}`;
 }
 
 // ---------------------------------------------------------------------------
@@ -537,7 +521,7 @@ function analyseStreams(rawStreams) {
 		const entry = buckets.get(quality);
 		if (!entry) continue;
 
-		const name = buildStreamName(quality, entry.scored);
+		const name = buildStreamName(quality);
 		const enriched = enrichWinnerStream({ ...entry.stream, name });
 		streams.push(enriched);
 
