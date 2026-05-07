@@ -570,6 +570,7 @@ async function fetchTorrentioStreams(type, id, torrentioBase = TORRENTIO_DEFAULT
 		try {
 			const response = await fetch(url, {
 				signal: AbortSignal.timeout(8_000),
+				cf: { cacheTtl: 28800, cacheEverything: true },
 			});
 
 			if (!response.ok) {
