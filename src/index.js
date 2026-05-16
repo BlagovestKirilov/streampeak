@@ -627,12 +627,12 @@ function notFound() {
  */
 function buildCachedResponse(streams) {
 	// Adaptive soft TTL:
-	// - 0 streams: 2 min (Torrentio failed)
+	// - 0 streams: 3h (Torrentio failed — avoid hammering with retries)
 	// - < 2 streams: 10 min (new release)
 	// - normal: 8h
 	let softTtl;
 	if (streams.length === 0) {
-		softTtl = 120;
+		softTtl = 10800;
 	} else if (streams.length < 2) {
 		softTtl = 600;
 	} else {
@@ -683,6 +683,7 @@ async function handleStreamRoute(request, ctx, type, id, torrentioBase) {
 		if (age > softTtl && ctx) {
 			ctx.waitUntil((async () => {
 				const rawStreams = await fetchTorrentioStreams(type, id, torrentioBase);
+				if (rawStreams.length === 0) return;
 				const fresh = buildCachedResponse(selectBestStreams(rawStreams));
 				await cache.put(cacheKey, fresh);
 			})());
@@ -696,7 +697,7 @@ async function handleStreamRoute(request, ctx, type, id, torrentioBase) {
 
 	const rawStreams = await fetchTorrentioStreams(type, id, torrentioBase);
 	const response = buildCachedResponse(selectBestStreams(rawStreams));
-	if (ctx) ctx.waitUntil(cache.put(cacheKey, response.clone()));
+	if (ctx && rawStreams.length > 0) ctx.waitUntil(cache.put(cacheKey, response.clone()));
 	return response;
 }
 

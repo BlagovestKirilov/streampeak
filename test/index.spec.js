@@ -876,6 +876,44 @@ describe("handleRequest — stale-while-revalidate", () => {
 		expect(putFn).toHaveBeenCalled();
 	});
 
+	it("SWR does NOT overwrite cache when Torrentio returns empty (429/failure)", async () => {
+		const staleTimestamp = String(Math.floor(Date.now() / 1000) - 30000);
+		const cachedBody = JSON.stringify({ streams: [{ name: "⚡ 1080p", url: "magnet:?good" }] });
+		const cachedResponse = new Response(cachedBody, {
+			status: 200,
+			headers: {
+				"Content-Type": "application/json; charset=utf-8",
+				"X-Cached-At": staleTimestamp,
+				"X-Soft-TTL": "28800",
+				"Cache-Control": "public, max-age=115200",
+			},
+		});
+
+		const putFn = vi.fn();
+		const cacheMock = { match: vi.fn().mockResolvedValue(cachedResponse), put: putFn };
+		vi.stubGlobal("caches", { default: cacheMock });
+
+		const fetchSpy = vi.fn().mockResolvedValue(
+			new Response("Internal Server Error", { status: 500 }),
+		);
+		vi.stubGlobal("fetch", fetchSpy);
+
+		const waitUntilFns = [];
+		const ctx = { waitUntil: (p) => waitUntilFns.push(p) };
+
+		const req = new Request("http://worker.test/stream/movie/tt1234567.json");
+		const res = await handleRequest(req, ctx);
+
+		expect(res.status).toBe(200);
+		const body = await res.json();
+		expect(body.streams[0].url).toBe("magnet:?good");
+
+		expect(waitUntilFns.length).toBe(1);
+		await waitUntilFns[0];
+		expect(fetchSpy).toHaveBeenCalled();
+		expect(putFn).not.toHaveBeenCalled();
+	});
+
 	it("returns cached response WITHOUT revalidation when still fresh", async () => {
 		const freshTimestamp = String(Math.floor(Date.now() / 1000) - 100); // 100s ago (fresh)
 		const cachedBody = JSON.stringify({ streams: [{ name: "⚡ 4K | BluRay", url: "magnet:?fresh" }] });
@@ -1235,7 +1273,7 @@ describe("handleRequest — caching", () => {
 		expect(noCacheMock.put).toHaveBeenCalledOnce();
 	});
 
-	it("uses 2-min soft TTL (max-age=480) when Torrentio returns empty (failure/429)", async () => {
+	it("uses 3h soft TTL (max-age=43200) when Torrentio returns empty (failure/429)", async () => {
 		vi.stubGlobal(
 			"fetch",
 			vi.fn().mockResolvedValue(
@@ -1247,8 +1285,25 @@ describe("handleRequest — caching", () => {
 		);
 		const req = new Request("http://worker.test/stream/movie/tt0468569.json");
 		const res = await handleRequest(req);
-		expect(res.headers.get("Cache-Control")).toBe("public, max-age=480");
-		expect(res.headers.get("X-Soft-TTL")).toBe("120");
+		expect(res.headers.get("Cache-Control")).toBe("public, max-age=43200");
+		expect(res.headers.get("X-Soft-TTL")).toBe("10800");
+	});
+
+	it("does NOT cache empty results on cold miss (Torrentio failed)", async () => {
+		vi.stubGlobal(
+			"fetch",
+			vi.fn().mockResolvedValue(
+				new Response(JSON.stringify({ streams: [] }), {
+					status: 200,
+					headers: { "content-type": "application/json" },
+				}),
+			),
+		);
+		const ctx = { waitUntil: vi.fn((p) => p) };
+		const req = new Request("http://worker.test/stream/movie/tt0468569.json");
+		await handleRequest(req, ctx);
+		expect(ctx.waitUntil).not.toHaveBeenCalled();
+		expect(noCacheMock.put).not.toHaveBeenCalled();
 	});
 
 	it("uses 10-min soft TTL (max-age=2400) when fewer than 2 streams (new release)", async () => {
