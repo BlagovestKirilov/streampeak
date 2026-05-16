@@ -570,11 +570,12 @@ async function fetchTorrentioStreams(type, id, torrentioBase = TORRENTIO_DEFAULT
 		try {
 			const response = await fetch(url, {
 				signal: AbortSignal.timeout(8_000),
-				cf: { cacheTtl: 28800, cacheEverything: true },
+				cf: { cacheTtl: 86400, cacheEverything: true },
 			});
 
 			if (!response.ok) {
 				console.error(`Torrentio returned ${response.status} for ${url}`);
+				if (response.status === 429 || response.status === 403) return [];
 				continue;
 			}
 
@@ -681,6 +682,16 @@ async function handleStreamRoute(request, ctx, type, id, torrentioBase) {
 		const age = Math.floor(Date.now() / 1000) - cachedAt;
 
 		if (age > softTtl && ctx) {
+			const cachedClone = cached.clone();
+			const touched = new Response(cachedClone.body, {
+				status: cachedClone.status,
+				headers: {
+					...Object.fromEntries(cachedClone.headers),
+					"X-Cached-At": String(Math.floor(Date.now() / 1000)),
+				},
+			});
+			ctx.waitUntil(cache.put(cacheKey, touched.clone()));
+
 			ctx.waitUntil((async () => {
 				const rawStreams = await fetchTorrentioStreams(type, id, torrentioBase);
 				if (rawStreams.length === 0) return;

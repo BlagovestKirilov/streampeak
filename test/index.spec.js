@@ -869,9 +869,9 @@ describe("handleRequest — stale-while-revalidate", () => {
 		const body = await res.json();
 		expect(body.streams[0].url).toBe("magnet:?old");
 
-		// Background revalidation should have been triggered
-		expect(waitUntilFns.length).toBe(1);
-		await waitUntilFns[0]; // await the revalidation promise
+		// Stampede guard touch + background revalidation
+		expect(waitUntilFns.length).toBe(2);
+		await Promise.all(waitUntilFns);
 		expect(fetchSpy).toHaveBeenCalled();
 		expect(putFn).toHaveBeenCalled();
 	});
@@ -908,10 +908,12 @@ describe("handleRequest — stale-while-revalidate", () => {
 		const body = await res.json();
 		expect(body.streams[0].url).toBe("magnet:?good");
 
-		expect(waitUntilFns.length).toBe(1);
-		await waitUntilFns[0];
+		// Stampede guard touch + background revalidation
+		expect(waitUntilFns.length).toBe(2);
+		await Promise.all(waitUntilFns);
 		expect(fetchSpy).toHaveBeenCalled();
-		expect(putFn).not.toHaveBeenCalled();
+		// put called once for the stampede touch, NOT for the failed revalidation
+		expect(putFn).toHaveBeenCalledOnce();
 	});
 
 	it("returns cached response WITHOUT revalidation when still fresh", async () => {
@@ -1412,6 +1414,32 @@ describe("fetchTorrentioStreams — non-JSON guard", () => {
 		);
 		const result = await fetchTorrentioStreams("movie", "tt1234567");
 		expect(result).toHaveLength(1);
+	});
+});
+
+describe("fetchTorrentioStreams — 429/403 no fallback", () => {
+	afterEach(() => vi.unstubAllGlobals());
+
+	it("returns [] immediately on 429 without trying fallback", async () => {
+		const fetchSpy = vi.fn().mockResolvedValueOnce(
+			new Response("Too Many Requests", { status: 429 }),
+		);
+		vi.stubGlobal("fetch", fetchSpy);
+
+		const result = await fetchTorrentioStreams("movie", "tt1234567");
+		expect(fetchSpy).toHaveBeenCalledTimes(1);
+		expect(result).toEqual([]);
+	});
+
+	it("returns [] immediately on 403 without trying fallback", async () => {
+		const fetchSpy = vi.fn().mockResolvedValueOnce(
+			new Response("Forbidden", { status: 403 }),
+		);
+		vi.stubGlobal("fetch", fetchSpy);
+
+		const result = await fetchTorrentioStreams("movie", "tt1234567");
+		expect(fetchSpy).toHaveBeenCalledTimes(1);
+		expect(result).toEqual([]);
 	});
 });
 
