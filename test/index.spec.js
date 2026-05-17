@@ -13,6 +13,7 @@ import worker, {
 	extractInfoHash,
 	extractSeeders,
 	extractSizeMB,
+	getSoftTtl,
 	seederScore,
 	scoreStream,
 	buildStreamName,
@@ -1743,5 +1744,175 @@ describe("Worker default export", () => {
 		expect(res.status).toBe(200);
 		const body = await res.json();
 		expect(body.id).toBe(MANIFEST.id);
+	});
+});
+
+// ---------------------------------------------------------------------------
+// getSoftTtl
+// ---------------------------------------------------------------------------
+
+describe("getSoftTtl", () => {
+	it("returns 10800 for 0 streams", () => {
+		expect(getSoftTtl(0)).toBe(10800);
+	});
+	it("returns 600 for 1 stream", () => {
+		expect(getSoftTtl(1)).toBe(600);
+	});
+	it("returns 28800 for 2+ streams", () => {
+		expect(getSoftTtl(2)).toBe(28800);
+		expect(getSoftTtl(10)).toBe(28800);
+	});
+});
+
+// ---------------------------------------------------------------------------
+// handleRequest — KV cache layer
+// ---------------------------------------------------------------------------
+
+describe("handleRequest — KV cache layer", () => {
+	const mockStreams = [
+		{ name: "T", title: "1080p WEB-DL\n\ud83d\udc64 100 \ud83d\udcbe 6 GB \u2699 S", url: "magnet:?kv" },
+		{ name: "T2", title: "720p WEB-DL\n\ud83d\udc64 50 \ud83d\udcbe 3 GB \u2699 S", url: "magnet:?kv2" },
+		{ name: "T3", title: "4K BluRay\n\ud83d\udc64 200 \ud83d\udcbe 10 GB \u2699 S", url: "magnet:?kv3" },
+	];
+
+	let noCacheMock;
+	let mockFetchFn;
+
+	beforeEach(() => {
+		noCacheMock = { match: vi.fn().mockResolvedValue(undefined), put: vi.fn() };
+		vi.stubGlobal("caches", { default: noCacheMock });
+		mockFetchFn = vi.fn().mockResolvedValue(
+			new Response(JSON.stringify({ streams: mockStreams }), {
+				status: 200,
+				headers: { "content-type": "application/json" },
+			}),
+		);
+		vi.stubGlobal("fetch", mockFetchFn);
+	});
+	afterEach(() => vi.unstubAllGlobals());
+
+	function createKvMock(value = null, metadata = null) {
+		return {
+			getWithMetadata: vi.fn().mockResolvedValue({ value, metadata }),
+			put: vi.fn().mockResolvedValue(undefined),
+		};
+	}
+
+	it("returns streams from KV when KV has a fresh entry (no Torrentio call)", async () => {
+		const now = Math.floor(Date.now() / 1000);
+		const kvData = { streams: [{ name: "\u26a1 1080p | WEB-DL", url: "magnet:?kv" }] };
+		const kvMock = createKvMock(kvData, { cachedAt: now - 100, softTtl: 28800 });
+
+		const req = new Request("http://worker.test/stream/movie/tt0468569.json");
+		const res = await handleRequest(req, undefined, { STREAM_CACHE: kvMock });
+
+		expect(res.status).toBe(200);
+		const body = await res.json();
+		expect(body.streams[0].url).toBe("magnet:?kv");
+		expect(mockFetchFn).not.toHaveBeenCalled();
+		expect(noCacheMock.match).not.toHaveBeenCalled();
+	});
+
+	it("triggers SWR revalidation when KV entry is stale", async () => {
+		const now = Math.floor(Date.now() / 1000);
+		const kvData = { streams: [{ name: "\u26a1 1080p", url: "magnet:?old-kv" }] };
+		const kvMock = createKvMock(kvData, { cachedAt: now - 30000, softTtl: 28800 });
+
+		const waitUntilFns = [];
+		const ctx = { waitUntil: (p) => waitUntilFns.push(p) };
+
+		const req = new Request("http://worker.test/stream/movie/tt0468569.json");
+		const res = await handleRequest(req, ctx, { STREAM_CACHE: kvMock });
+
+		expect(res.status).toBe(200);
+		const body = await res.json();
+		expect(body.streams[0].url).toBe("magnet:?old-kv");
+
+		// Stampede touch + background revalidation
+		expect(waitUntilFns.length).toBe(2);
+		await Promise.all(waitUntilFns);
+		expect(mockFetchFn).toHaveBeenCalled();
+		// KV put called: once for stampede touch, once for fresh data
+		expect(kvMock.put).toHaveBeenCalledTimes(2);
+	});
+
+	it("SWR does NOT update KV when Torrentio returns empty (stale KV)", async () => {
+		const now = Math.floor(Date.now() / 1000);
+		const kvData = { streams: [{ name: "\u26a1 1080p", url: "magnet:?good-kv" }] };
+		const kvMock = createKvMock(kvData, { cachedAt: now - 30000, softTtl: 28800 });
+
+		vi.stubGlobal("fetch", vi.fn().mockResolvedValue(
+			new Response("Too Many Requests", { status: 429 }),
+		));
+
+		const waitUntilFns = [];
+		const ctx = { waitUntil: (p) => waitUntilFns.push(p) };
+
+		const req = new Request("http://worker.test/stream/movie/tt0468569.json");
+		const res = await handleRequest(req, ctx, { STREAM_CACHE: kvMock });
+
+		expect(res.status).toBe(200);
+		await Promise.all(waitUntilFns);
+		// Only the stampede touch, NOT a fresh-data put
+		expect(kvMock.put).toHaveBeenCalledOnce();
+	});
+
+	it("falls through to Cache API when KV misses", async () => {
+		const kvMock = createKvMock(null, null);
+
+		const ctx = { waitUntil: vi.fn((p) => p) };
+		const req = new Request("http://worker.test/stream/movie/tt0468569.json");
+		const res = await handleRequest(req, ctx, { STREAM_CACHE: kvMock });
+
+		expect(res.status).toBe(200);
+		expect(kvMock.getWithMetadata).toHaveBeenCalledOnce();
+		expect(noCacheMock.match).toHaveBeenCalledOnce();
+		expect(mockFetchFn).toHaveBeenCalled();
+	});
+
+	it("stores in both Cache API and KV on cold miss", async () => {
+		const kvMock = createKvMock(null, null);
+
+		const waitUntilFns = [];
+		const ctx = { waitUntil: (p) => waitUntilFns.push(p) };
+		const req = new Request("http://worker.test/stream/movie/tt0468569.json");
+		await handleRequest(req, ctx, { STREAM_CACHE: kvMock });
+
+		await Promise.all(waitUntilFns);
+		expect(noCacheMock.put).toHaveBeenCalledOnce();
+		expect(kvMock.put).toHaveBeenCalledOnce();
+	});
+
+	it("does NOT store in KV on cold miss when Torrentio fails", async () => {
+		const kvMock = createKvMock(null, null);
+
+		vi.stubGlobal("fetch", vi.fn().mockResolvedValue(
+			new Response(JSON.stringify({ streams: [] }), {
+				status: 200,
+				headers: { "content-type": "application/json" },
+			}),
+		));
+
+		const ctx = { waitUntil: vi.fn((p) => p) };
+		const req = new Request("http://worker.test/stream/movie/tt0468569.json");
+		await handleRequest(req, ctx, { STREAM_CACHE: kvMock });
+
+		expect(kvMock.put).not.toHaveBeenCalled();
+		expect(noCacheMock.put).not.toHaveBeenCalled();
+	});
+
+	it("falls through to Cache API gracefully when KV throws", async () => {
+		const kvMock = {
+			getWithMetadata: vi.fn().mockRejectedValue(new Error("KV read limit exceeded")),
+			put: vi.fn(),
+		};
+
+		const ctx = { waitUntil: vi.fn((p) => p) };
+		const req = new Request("http://worker.test/stream/movie/tt0468569.json");
+		const res = await handleRequest(req, ctx, { STREAM_CACHE: kvMock });
+
+		expect(res.status).toBe(200);
+		expect(noCacheMock.match).toHaveBeenCalledOnce();
+		expect(mockFetchFn).toHaveBeenCalled();
 	});
 });

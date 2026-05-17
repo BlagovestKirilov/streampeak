@@ -626,19 +626,14 @@ function notFound() {
  * - Cache-Control max-age: set to 4× soft TTL so CF cache keeps the entry around
  *   long enough for stale serving + revalidation
  */
+function getSoftTtl(streamCount) {
+	if (streamCount === 0) return 10800;
+	if (streamCount < 2) return 600;
+	return 28800;
+}
+
 function buildCachedResponse(streams) {
-	// Adaptive soft TTL:
-	// - 0 streams: 3h (Torrentio failed — avoid hammering with retries)
-	// - < 2 streams: 10 min (new release)
-	// - normal: 8h
-	let softTtl;
-	if (streams.length === 0) {
-		softTtl = 10800;
-	} else if (streams.length < 2) {
-		softTtl = 600;
-	} else {
-		softTtl = 28800;
-	}
+	const softTtl = getSoftTtl(streams.length);
 
 	const headers = {
 		...CORS_HEADERS,
@@ -665,50 +660,109 @@ function buildCachedResponse(streams) {
  *   OPTIONS *  (CORS pre-flight)
  *   GET  /  (redirect → /manifest.json)
  */
-async function handleStreamRoute(request, ctx, type, id, torrentioBase) {
+function revalidateKv(kv, kvKey, type, id, torrentioBase) {
+	return async () => {
+		const rawStreams = await fetchTorrentioStreams(type, id, torrentioBase);
+		if (rawStreams.length === 0) return;
+		const streams = selectBestStreams(rawStreams);
+		const softTtl = getSoftTtl(streams.length);
+		await kv.put(kvKey, JSON.stringify({ streams }), {
+			expirationTtl: softTtl * 4,
+			metadata: { cachedAt: Math.floor(Date.now() / 1000), softTtl },
+		});
+	};
+}
+
+async function tryKvCache(kv, kvKey, now, ctx, type, id, torrentioBase) {
+	const { value, metadata } = await kv.getWithMetadata(kvKey, "json");
+	if (!value || !metadata) return null;
+
+	if (now - metadata.cachedAt > metadata.softTtl && ctx) {
+		ctx.waitUntil(kv.put(kvKey, JSON.stringify(value), {
+			expirationTtl: metadata.softTtl * 4,
+			metadata: { cachedAt: now, softTtl: metadata.softTtl },
+		}));
+		ctx.waitUntil(revalidateKv(kv, kvKey, type, id, torrentioBase)());
+	}
+
+	return jsonResponse(value, 200, metadata.softTtl * 4);
+}
+
+function tryCacheApiRevalidation(ctx, cache, cacheKey, cached, now, type, id, torrentioBase, kv, kvKey) {
+	const cachedClone = cached.clone();
+	const touched = new Response(cachedClone.body, {
+		status: cachedClone.status,
+		headers: {
+			...Object.fromEntries(cachedClone.headers),
+			"X-Cached-At": String(now),
+		},
+	});
+	ctx.waitUntil(cache.put(cacheKey, touched.clone()));
+
+	ctx.waitUntil((async () => {
+		const rawStreams = await fetchTorrentioStreams(type, id, torrentioBase);
+		if (rawStreams.length === 0) return;
+		const streams = selectBestStreams(rawStreams);
+		await cache.put(cacheKey, buildCachedResponse(streams));
+		if (kv) {
+			const kvSoftTtl = getSoftTtl(streams.length);
+			await kv.put(kvKey, JSON.stringify({ streams }), {
+				expirationTtl: kvSoftTtl * 4,
+				metadata: { cachedAt: Math.floor(Date.now() / 1000), softTtl: kvSoftTtl },
+			});
+		}
+	})());
+}
+
+async function handleStreamRoute(request, ctx, type, id, torrentioBase, kv) {
 	if (!/^tt\d+(:\d+:\d+)?$/.test(id)) {
 		return jsonResponse({ streams: [] }, 200, 60);
 	}
 
+	const now = Math.floor(Date.now() / 1000);
+	const kvKey = `stream:${type}:${id}`;
+
+	// ── Layer 1: KV (global, persistent) ────────────────────────────
+	if (kv) {
+		try {
+			const kvResult = await tryKvCache(kv, kvKey, now, ctx, type, id, torrentioBase);
+			if (kvResult) return kvResult;
+		} catch (err) { console.error(`KV read failed for ${kvKey}: ${err.message}`); }
+	}
+
+	// ── Layer 2: Cache API (per-colo, fast) ──────────────────────────
 	const cache = caches.default;
-	const cacheKey = new Request(
-		`${new URL(request.url).origin}/stream/${type}/${id}.json`,
-	);
+	const cacheKey = new Request(`${new URL(request.url).origin}/stream/${type}/${id}.json`);
 	const cached = await cache.match(cacheKey);
 
 	if (cached) {
 		const cachedAt = Number.parseInt(cached.headers.get("X-Cached-At") ?? "0", 10);
 		const softTtl = Number.parseInt(cached.headers.get("X-Soft-TTL") ?? "28800", 10);
-		const age = Math.floor(Date.now() / 1000) - cachedAt;
-
-		if (age > softTtl && ctx) {
-			const cachedClone = cached.clone();
-			const touched = new Response(cachedClone.body, {
-				status: cachedClone.status,
-				headers: {
-					...Object.fromEntries(cachedClone.headers),
-					"X-Cached-At": String(Math.floor(Date.now() / 1000)),
-				},
-			});
-			ctx.waitUntil(cache.put(cacheKey, touched.clone()));
-
-			ctx.waitUntil((async () => {
-				const rawStreams = await fetchTorrentioStreams(type, id, torrentioBase);
-				if (rawStreams.length === 0) return;
-				const fresh = buildCachedResponse(selectBestStreams(rawStreams));
-				await cache.put(cacheKey, fresh);
-			})());
+		if (now - cachedAt > softTtl && ctx) {
+			tryCacheApiRevalidation(ctx, cache, cacheKey, cached, now, type, id, torrentioBase, kv, kvKey);
 		}
-
 		return new Response(cached.body, {
 			status: cached.status,
 			headers: { ...Object.fromEntries(cached.headers), ...CORS_HEADERS },
 		});
 	}
 
+	// ── Layer 3: Cold miss — fetch from Torrentio ────────────────────
 	const rawStreams = await fetchTorrentioStreams(type, id, torrentioBase);
-	const response = buildCachedResponse(selectBestStreams(rawStreams));
-	if (ctx && rawStreams.length > 0) ctx.waitUntil(cache.put(cacheKey, response.clone()));
+	const streams = selectBestStreams(rawStreams);
+	const response = buildCachedResponse(streams);
+
+	if (ctx && rawStreams.length > 0) {
+		ctx.waitUntil(cache.put(cacheKey, response.clone()));
+		if (kv) {
+			const kvSoftTtl = getSoftTtl(streams.length);
+			ctx.waitUntil(kv.put(kvKey, JSON.stringify({ streams }), {
+				expirationTtl: kvSoftTtl * 4,
+				metadata: { cachedAt: now, softTtl: kvSoftTtl },
+			}));
+		}
+	}
+
 	return response;
 }
 
@@ -739,7 +793,7 @@ async function handleRequest(request, ctx, env = {}) {
 	const streamMatch = /^\/stream\/(movie|series)\/([^/]+)\.json$/.exec(pathname);
 	if (streamMatch) {
 		const [, type, id] = streamMatch;
-		return handleStreamRoute(request, ctx, type, decodeURIComponent(id), torrentioBase);
+		return handleStreamRoute(request, ctx, type, decodeURIComponent(id), torrentioBase, env.STREAM_CACHE);
 	}
 
 	const debugMatch = /^\/debug\/(movie|series)\/([^/]+)$/.exec(pathname);
@@ -781,6 +835,7 @@ export {
 	extractInfoHash,
 	extractSeeders,
 	extractSizeMB,
+	getSoftTtl,
 	seederScore,
 	scoreStream,
 	buildStreamName,

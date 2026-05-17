@@ -6,5 +6,11 @@
 	"observability": {
 		"enabled": true
 	},
-	"upload_source_maps": true
+	"upload_source_maps": true,
+	"kv_namespaces": [
+		{
+			"binding": "STREAM_CACHE",
+			"id": "2c2956ea0de54052bfd55b91d7d3ea94"
+		}
+	]
 }
