@@ -1758,9 +1758,13 @@ describe("getSoftTtl", () => {
 	it("returns 600 for 1 stream", () => {
 		expect(getSoftTtl(1)).toBe(600);
 	});
-	it("returns 28800 for 2+ streams", () => {
+	it("returns 28800 for 2-4 streams", () => {
 		expect(getSoftTtl(2)).toBe(28800);
-		expect(getSoftTtl(10)).toBe(28800);
+		expect(getSoftTtl(4)).toBe(28800);
+	});
+	it("returns 86400 for 5+ streams (established content)", () => {
+		expect(getSoftTtl(5)).toBe(86400);
+		expect(getSoftTtl(10)).toBe(86400);
 	});
 });
 
@@ -1791,10 +1795,12 @@ describe("handleRequest — KV cache layer", () => {
 	});
 	afterEach(() => vi.unstubAllGlobals());
 
-	function createKvMock(value = null, metadata = null) {
+	function createKvMock(value = null, metadata = null, getOverrides = {}) {
 		return {
+			get: vi.fn((key) => Promise.resolve(getOverrides[key] ?? null)),
 			getWithMetadata: vi.fn().mockResolvedValue({ value, metadata }),
 			put: vi.fn().mockResolvedValue(undefined),
+			delete: vi.fn().mockResolvedValue(undefined),
 		};
 	}
 
@@ -1811,6 +1817,19 @@ describe("handleRequest — KV cache layer", () => {
 		expect(body.streams[0].url).toBe("magnet:?kv");
 		expect(mockFetchFn).not.toHaveBeenCalled();
 		expect(noCacheMock.match).not.toHaveBeenCalled();
+	});
+
+	it("returns empty immediately when known-empty flag is set (no Torrentio call)", async () => {
+		const kvMock = createKvMock(null, null, { "empty:movie:tt9999999": "1" });
+
+		const req = new Request("http://worker.test/stream/movie/tt9999999.json");
+		const res = await handleRequest(req, undefined, { STREAM_CACHE: kvMock });
+
+		expect(res.status).toBe(200);
+		const body = await res.json();
+		expect(body.streams).toEqual([]);
+		expect(mockFetchFn).not.toHaveBeenCalled();
+		expect(kvMock.getWithMetadata).not.toHaveBeenCalled();
 	});
 
 	it("triggers SWR revalidation when KV entry is stale", async () => {
@@ -1832,8 +1851,23 @@ describe("handleRequest — KV cache layer", () => {
 		expect(waitUntilFns.length).toBe(2);
 		await Promise.all(waitUntilFns);
 		expect(mockFetchFn).toHaveBeenCalled();
-		// KV put called: once for stampede touch, once for fresh data
-		expect(kvMock.put).toHaveBeenCalledTimes(2);
+		// KV put: stampede touch + lock + fresh data
+		expect(kvMock.put).toHaveBeenCalledTimes(3);
+	});
+
+	it("revalidation lock prevents duplicate Torrentio calls", async () => {
+		const now = Math.floor(Date.now() / 1000);
+		const kvData = { streams: [{ name: "\u26a1 1080p", url: "magnet:?old" }] };
+		const kvMock = createKvMock(kvData, { cachedAt: now - 30000, softTtl: 28800 }, { "lock:movie:tt0468569": "1" });
+
+		const waitUntilFns = [];
+		const ctx = { waitUntil: (p) => waitUntilFns.push(p) };
+
+		const req = new Request("http://worker.test/stream/movie/tt0468569.json");
+		await handleRequest(req, ctx, { STREAM_CACHE: kvMock });
+
+		await Promise.all(waitUntilFns);
+		expect(mockFetchFn).not.toHaveBeenCalled();
 	});
 
 	it("SWR does NOT update KV when Torrentio returns empty (stale KV)", async () => {
@@ -1853,8 +1887,8 @@ describe("handleRequest — KV cache layer", () => {
 
 		expect(res.status).toBe(200);
 		await Promise.all(waitUntilFns);
-		// Only the stampede touch, NOT a fresh-data put
-		expect(kvMock.put).toHaveBeenCalledOnce();
+		// Stampede touch + lock put, but NOT a fresh-data put
+		expect(kvMock.put).toHaveBeenCalledTimes(2);
 	});
 
 	it("falls through to Cache API when KV misses", async () => {
@@ -1883,7 +1917,7 @@ describe("handleRequest — KV cache layer", () => {
 		expect(kvMock.put).toHaveBeenCalledOnce();
 	});
 
-	it("does NOT store in KV on cold miss when Torrentio fails", async () => {
+	it("increments miss counter on cold miss when Torrentio fails", async () => {
 		const kvMock = createKvMock(null, null);
 
 		vi.stubGlobal("fetch", vi.fn().mockResolvedValue(
@@ -1893,18 +1927,43 @@ describe("handleRequest — KV cache layer", () => {
 			}),
 		));
 
-		const ctx = { waitUntil: vi.fn((p) => p) };
+		const waitUntilFns = [];
+		const ctx = { waitUntil: (p) => waitUntilFns.push(p) };
 		const req = new Request("http://worker.test/stream/movie/tt0468569.json");
 		await handleRequest(req, ctx, { STREAM_CACHE: kvMock });
 
-		expect(kvMock.put).not.toHaveBeenCalled();
+		await Promise.all(waitUntilFns);
 		expect(noCacheMock.put).not.toHaveBeenCalled();
+		// Should write the miss counter
+		expect(kvMock.put).toHaveBeenCalledWith("miss:movie:tt0468569", "1", { expirationTtl: 86400 });
+	});
+
+	it("marks known-empty after 3 consecutive misses", async () => {
+		const kvMock = createKvMock(null, null, { "miss:movie:tt0468569": "2" });
+
+		vi.stubGlobal("fetch", vi.fn().mockResolvedValue(
+			new Response(JSON.stringify({ streams: [] }), {
+				status: 200,
+				headers: { "content-type": "application/json" },
+			}),
+		));
+
+		const waitUntilFns = [];
+		const ctx = { waitUntil: (p) => waitUntilFns.push(p) };
+		const req = new Request("http://worker.test/stream/movie/tt0468569.json");
+		await handleRequest(req, ctx, { STREAM_CACHE: kvMock });
+
+		await Promise.all(waitUntilFns);
+		expect(kvMock.put).toHaveBeenCalledWith("empty:movie:tt0468569", "1", { expirationTtl: 604800 });
+		expect(kvMock.delete).toHaveBeenCalledWith("miss:movie:tt0468569");
 	});
 
 	it("falls through to Cache API gracefully when KV throws", async () => {
 		const kvMock = {
+			get: vi.fn().mockRejectedValue(new Error("KV read limit exceeded")),
 			getWithMetadata: vi.fn().mockRejectedValue(new Error("KV read limit exceeded")),
 			put: vi.fn(),
+			delete: vi.fn(),
 		};
 
 		const ctx = { waitUntil: vi.fn((p) => p) };

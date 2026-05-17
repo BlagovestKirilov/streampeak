@@ -629,6 +629,7 @@ function notFound() {
 function getSoftTtl(streamCount) {
 	if (streamCount === 0) return 10800;
 	if (streamCount < 2) return 600;
+	if (streamCount >= 5) return 86400;
 	return 28800;
 }
 
@@ -662,6 +663,11 @@ function buildCachedResponse(streams) {
  */
 function revalidateKv(kv, kvKey, type, id, torrentioBase) {
 	return async () => {
+		const lockKey = `lock:${type}:${id}`;
+		const lock = await kv.get(lockKey);
+		if (lock) return;
+		await kv.put(lockKey, "1", { expirationTtl: 60 });
+
 		const rawStreams = await fetchTorrentioStreams(type, id, torrentioBase);
 		if (rawStreams.length === 0) return;
 		const streams = selectBestStreams(rawStreams);
@@ -674,6 +680,10 @@ function revalidateKv(kv, kvKey, type, id, torrentioBase) {
 }
 
 async function tryKvCache(kv, kvKey, now, ctx, type, id, torrentioBase) {
+	const emptyKey = `empty:${type}:${id}`;
+	const emptyFlag = await kv.get(emptyKey);
+	if (emptyFlag) return jsonResponse({ streams: [] }, 200, 604800);
+
 	const { value, metadata } = await kv.getWithMetadata(kvKey, "json");
 	if (!value || !metadata) return null;
 
@@ -761,6 +771,16 @@ async function handleStreamRoute(request, ctx, type, id, torrentioBase, kv) {
 				metadata: { cachedAt: now, softTtl: kvSoftTtl },
 			}));
 		}
+	} else if (ctx && rawStreams.length === 0 && kv) {
+		ctx.waitUntil((async () => {
+			const missKey = `miss:${type}:${id}`;
+			const missCount = Number.parseInt(await kv.get(missKey) ?? "0", 10) + 1;
+			await kv.put(missKey, String(missCount), { expirationTtl: 86400 });
+			if (missCount >= 3) {
+				await kv.put(`empty:${type}:${id}`, "1", { expirationTtl: 604800 });
+				await kv.delete(missKey);
+			}
+		})());
 	}
 
 	return response;
