@@ -20,7 +20,7 @@ const MANIFEST = {
 	version: "1.0.1",
 	name: "StreamPeak",
 	description:
-		"Stop guessing which stream to pick. StreamPeak analyzes every available stream and surfaces only the best. Built by Blagovest Kirilov.",
+		"Stop guessing which stream to pick. StreamPeak analyzes every available stream and surfaces only the best.",
 	types: ["movie", "series"],
 	catalogs: [],
 	resources: ["stream"],
